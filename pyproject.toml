@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reldoctor"
+version = "0.1.0"
+description = "Audit a Python release end-to-end: wheel and sdist metadata, versions, entry points, licenses, README rendering"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "calasdan-sketch" }]
+keywords = ["packaging", "wheel", "sdist", "release", "metadata", "pypi", "qa"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+reldoctor = "reldoctor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
