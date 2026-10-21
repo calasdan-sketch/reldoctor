@@ -15,7 +15,9 @@ from reldoctor.doctor import (
 
 
 def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=None,
-               extra_meta="", entry_points=None, include_record=True, corrupt=False):
+               extra_meta="", entry_points=None, include_record=True, corrupt=False,
+               license_field="License: MIT", summary="A demo package",
+               requires_python=">=3.9"):
     dist = f"{name}-{version}.dist-info"
     path = tmp / f"{name}-{version}-py3-none-any.whl"
     if corrupt:
@@ -25,9 +27,9 @@ def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=N
         f"Metadata-Version: 2.1\n"
         f"Name: {meta_name or name}\n"
         f"Version: {meta_version or version}\n"
-        f"Summary: A demo package\n"
-        f"Requires-Python: >=3.9\n"
-        f"License: MIT\n"
+        f"Summary: {summary}\n"
+        f"Requires-Python: {requires_python}\n"
+        f"{license_field + chr(10) if license_field else ''}"
         f"Description-Content-Type: text/markdown\n"
         f"{extra_meta}\n"
         f"# demo\n\nLong description body.\n"
@@ -124,9 +126,44 @@ def test_entry_point_validation(tmp_path):
 
 
 def test_summary_and_python_requires_warns(tmp_path):
-    make_wheel(tmp_path, extra_meta="Summary:\nRequires-Python:")
+    make_wheel(tmp_path, summary="", requires_python="")
     found = codes(check_wheel(str(tmp_path / "demo-1.0.0-py3-none-any.whl")))
     assert "no_summary" in found and "no_requires_python" in found
+
+
+def test_license_found_in_license_expression_or_classifier(tmp_path):
+    # SPDX License-Expression header (what modern setuptools emits)
+    make_wheel(tmp_path, name="spdx", version="1.0.0",
+               extra_meta="License-Expression: MIT\n", license_field="")
+    assert "no_license_metadata" not in codes(
+        check_wheel(str(tmp_path / "spdx-1.0.0-py3-none-any.whl")))
+
+    # classifier-only metadata (the dict-vs-Message crash CI caught)
+    make_wheel(tmp_path, name="cls", version="1.0.0",
+               extra_meta="Classifier: OSI Approved :: MIT License\n", license_field="")
+    assert "no_license_metadata" not in codes(
+        check_wheel(str(tmp_path / "cls-1.0.0-py3-none-any.whl")))
+
+
+def test_license_warns_when_truly_absent(tmp_path):
+    make_wheel(tmp_path, name="nolicense", version="1.0.0", license_field="")
+    assert "no_license_metadata" in codes(
+        check_wheel(str(tmp_path / "nolicense-1.0.0-py3-none-any.whl")))
+
+
+def test_real_world_metadata_parses_repeated_headers(tmp_path):
+    # repeated Classifier headers must all survive parsing (Message, not dict)
+    p = make_wheel(tmp_path, name="rep", version="1.0.0", license_field="",
+                   extra_meta="Classifier: OSI Approved :: MIT License\n"
+                              "Classifier: Topic :: Utilities\n")
+    from reldoctor.doctor import check_wheel, parse_metadata
+    import zipfile as zf
+    with zf.ZipFile(p) as z:
+        text = z.read("rep-1.0.0.dist-info/METADATA").decode()
+    msg = parse_metadata(text)
+    assert len(msg.get_all("Classifier", [])) == 2
+    # license via classifier passes the strict check without crashing
+    assert check_wheel(p) == [], check_wheel(p)
 
 
 def test_sdist_missing_build_config(tmp_path):

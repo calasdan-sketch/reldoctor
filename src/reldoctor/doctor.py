@@ -5,6 +5,7 @@ the source tree — so findings reflect what installers and PyPI will see.
 """
 from __future__ import annotations
 
+import email.message
 import email.parser
 import io
 import os
@@ -38,9 +39,10 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def parse_metadata(text: str) -> Dict[str, str]:
-    msg = email.parser.Parser().parsestr(text)
-    return {k: v for k, v in msg.items()}
+def parse_metadata(text: str) -> email.message.Message:
+    """Parse RFC822-style metadata into a Message (keeps repeated headers such
+    as Classifier listable via get_all — a plain dict would lose them)."""
+    return email.parser.Parser().parsestr(text)
 
 
 def check_wheel(path: str) -> List[Finding]:
