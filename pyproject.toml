@@ -1,21 +1,25 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # SPDX `license = "MIT"` needs PEP 639 support
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "reldoctor"
-version = "0.1.0"
-description = "Audit a Python release end-to-end: wheel and sdist metadata, versions, entry points, licenses, README rendering"
+version = "0.2.0"
+description = "Pre-upload doctor for Python releases: catches what PyPI will reject, leaked secrets, tampered RECORDs and wheel/sdist drift. Pure stdlib."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "calasdan-sketch" }]
-keywords = ["packaging", "wheel", "sdist", "release", "metadata", "pypi", "qa"]
+keywords = ["packaging", "wheel", "sdist", "release", "metadata", "pypi", "qa", "secrets", "supply-chain"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Environment :: Console",
     "Topic :: Software Development :: Build Tools",
 ]
+
+[project.urls]
+Source = "https://github.com/calasdan-sketch/reldoctor"
+Changelog = "https://github.com/calasdan-sketch/reldoctor/blob/main/CHANGELOG.md"
 
 [project.scripts]
 reldoctor = "reldoctor.cli:main"
