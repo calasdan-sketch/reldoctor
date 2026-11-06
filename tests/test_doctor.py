@@ -1,4 +1,7 @@
 """Artifact tests: build synthetic wheels/sdists and diagnose them."""
+import base64
+import csv
+import hashlib
 import io
 import tarfile
 import zipfile
@@ -17,14 +20,14 @@ from reldoctor.doctor import (
 def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=None,
                extra_meta="", entry_points=None, include_record=True, corrupt=False,
                license_field="License: MIT", summary="A demo package",
-               requires_python=">=3.9"):
+               requires_python=">=3.9", extra_files=None, metadata_version="2.1"):
     dist = f"{name}-{version}.dist-info"
     path = tmp / f"{name}-{version}-py3-none-any.whl"
     if corrupt:
         path.write_bytes(b"not a zip at all")
         return str(path)
     meta = (
-        f"Metadata-Version: 2.1\n"
+        f"Metadata-Version: {metadata_version}\n"
         f"Name: {meta_name or name}\n"
         f"Version: {meta_version or version}\n"
         f"Summary: {summary}\n"
@@ -34,23 +37,35 @@ def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=N
         f"{extra_meta}\n"
         f"# demo\n\nLong description body.\n"
     )
+    files = {
+        f"{dist}/METADATA": meta,
+        f"{dist}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        "demo/__init__.py": "__version__ = '1.0.0'\n",
+    }
+    if entry_points:
+        files[f"{dist}/entry_points.txt"] = entry_points
+    files.update(extra_files or {})
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr(f"{dist}/METADATA", meta)
-        z.writestr(f"{dist}/WHEEL",
-                   "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
-        z.writestr("demo/__init__.py", "__version__ = '1.0.0'\n")
-        records = [f"{dist}/METADATA,,", f"{dist}/WHEEL,,", "demo/__init__.py,,"]
-        if entry_points:
-            z.writestr(f"{dist}/entry_points.txt", entry_points)
-            records.append(f"{dist}/entry_points.txt,,")
+        records = []
+        for member, data in files.items():
+            blob = data if isinstance(data, bytes) else data.encode()
+            z.writestr(member, blob)
+            records.append(record_row(member, blob))
         if include_record:
             records.append(f"{dist}/RECORD,,")
             z.writestr(f"{dist}/RECORD", "\n".join(records) + "\n")
     return str(path)
 
 
+def record_row(member, blob):
+    digest = base64.urlsafe_b64encode(hashlib.sha256(blob).digest()).rstrip(b"=").decode()
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="").writerow([member, f"sha256={digest}", len(blob)])
+    return buf.getvalue()
+
+
 def make_sdist(tmp, name="demo", version="1.0.0", build_config="pyproject.toml",
-               include_license=True, pkg_info=True):
+               include_license=True, pkg_info=True, pkg_info_extra="", extra_files=None):
     path = tmp / f"{name}-{version}.tar.gz"
     root = f"{name}-{version}"
     with tarfile.open(path, "w:gz") as tf:
@@ -60,12 +75,15 @@ def make_sdist(tmp, name="demo", version="1.0.0", build_config="pyproject.toml",
             info.size = len(blob)
             tf.addfile(info, io.BytesIO(blob))
         if pkg_info:
-            add(f"{root}/PKG-INFO", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+            add(f"{root}/PKG-INFO",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{pkg_info_extra}")
         if build_config:
             add(f"{root}/{build_config}", "[project]\nname = 'demo'\n")
         if include_license:
             add(f"{root}/LICENSE", "MIT license text\n")
         add(f"{root}/demo/__init__.py", "x = 1\n")
+        for member, data in (extra_files or {}).items():
+            add(f"{root}/{member}", data)
     return str(path)
 
 

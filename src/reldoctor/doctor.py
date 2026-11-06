@@ -2,27 +2,136 @@
 
 Everything here inspects what will actually be uploaded — the artifact, not
 the source tree — so findings reflect what installers and PyPI will see.
+Archives are treated as untrusted: nothing is extracted, reads are bounded,
+and member names are never used as filesystem paths.
 """
 from __future__ import annotations
 
+import base64
+import csv
 import email.message
 import email.parser
+import hashlib
 import io
 import os
 import re
 import tarfile
 import zipfile
+import zlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from .safety import (
+    JUNK_DIRS,
+    JUNK_FILES,
+    VCS_DIRS,
+    link_escapes,
+    path_allowed,
+    scan_secrets,
+    sensitive_file_kind,
+    unsafe_path_reason,
+)
 
 PEP440 = re.compile(
     r"^([1-9][0-9]*!)?(0|[1-9][0-9]*)"
     r"(\.(0|[1-9][0-9]*))*"
     r"((a|b|rc)(0|[1-9][0-9]*))?"
     r"(\.post(0|[1-9][0-9]*))?"
-    r"(\.dev(0|[1-9][0-9]*))?$"
+    r"(\.dev(0|[1-9][0-9]*))?"
+    r"(\+[a-z0-9]+(\.[a-z0-9]+)*)?$"
 )
-ENTRY_POINT = re.compile(r"^[A-Za-z_][\w.-]*\s*=\s*[A-Za-z_][\w.]*\s*(:\s*[A-Za-z_][\w.]*)?$")
+# name = module[.sub]:attr[.sub] [extra1, extra2]
+ENTRY_POINT = re.compile(
+    r"^[^=\s][^=]*?\s*=\s*[A-Za-z_][\w.]*\s*(:\s*[A-Za-z_][\w.]*)?"
+    r"\s*(\[\s*[\w.-]+(\s*,\s*[\w.-]+)*\s*\])?$"
+)
+CONTENT_TYPES = {"text/plain", "text/x-rst", "text/markdown"}
+BINARY_EXT = re.compile(r"\.(pyd|dll|dylib|so(\.\d+)*)$", re.IGNORECASE)
+
+# Bounds for untrusted archives.
+MAX_METADATA_BYTES = 16 * 1024 * 1024        # METADATA / PKG-INFO / RECORD
+MAX_SCAN_BYTES = 2 * 1024 * 1024             # per-file secret scan
+MAX_ARCHIVE_READ = 1024 * 1024 * 1024        # total bytes hashed/scanned per archive
+CHUNK = 1024 * 1024
+
+# code -> (severity, what it means). Severity lives here so a code is always
+# reported at the same level, and `reldoctor --list-checks` documents itself.
+CHECKS: Dict[str, Tuple[str, str]] = {
+    # discovery
+    "no_artifacts": ("error", "no wheel or sdist found"),
+    "missing_wheel": ("warn", "no wheel built; pip will build from the sdist"),
+    "missing_sdist": ("warn", "no sdist built"),
+    "sdist_zip_format": ("warn", "sdist is a .zip; PEP 625 sdists are .tar.gz"),
+    # archive safety (both formats)
+    "wheel_corrupt": ("error", "wheel is not a readable zip"),
+    "sdist_corrupt": ("error", "sdist is not a readable tarball"),
+    "unsafe_path": ("error", "member path is absolute, uses '..', a drive letter or backslashes"),
+    "duplicate_entry": ("error", "the same path appears twice in the archive"),
+    "case_collision": ("warn", "paths differ only by case (collide on Windows/macOS)"),
+    "unsafe_link": ("error", "sdist symlink/hardlink points outside the archive"),
+    "special_file": ("error", "sdist contains a device, FIFO or other special file"),
+    "archive_too_large": ("warn", "archive exceeds the read budget; some content checks skipped"),
+    "member_unreadable": ("error", "an archive member could not be read"),
+    # leaks and junk
+    "sensitive_file": ("error", "a credential file (.env, .pypirc, SSH key...) is shipped"),
+    "secret_in_file": ("error", "a file contains a token or private key"),
+    "vcs_metadata_shipped": ("warn", ".git/.hg/.svn directory shipped"),
+    "junk_file": ("warn", "tool caches, editor dirs or OS junk shipped"),
+    "bytecode_shipped": ("warn", "wheel ships .pyc/__pycache__"),
+    # wheel structure
+    "bad_wheel_filename": ("error", "wheel filename is not name-version[-build]-py-abi-plat.whl"),
+    "wheel_name_not_normalized": ("warn", "wheel filename project part is not normalized"),
+    "wheel_no_dist_info": ("error", "not exactly one .dist-info/METADATA"),
+    "no_wheel_file": ("error", ".dist-info/WHEEL missing"),
+    "wheel_no_version": ("error", "WHEEL lacks Wheel-Version"),
+    "wheel_tag_mismatch": ("warn", "WHEEL Tag lines disagree with the filename tags"),
+    "binary_in_pure_wheel": ("error", "compiled extension inside a none-any wheel"),
+    "no_record": ("error", ".dist-info/RECORD missing"),
+    "record_incomplete": ("warn", "files in the wheel are not listed in RECORD"),
+    "record_missing_file": ("error", "RECORD lists a file that is not in the wheel"),
+    "record_hash_mismatch": ("error", "RECORD hash does not match the file"),
+    "record_size_mismatch": ("error", "RECORD size does not match the file"),
+    "record_weak_hash": ("error", "RECORD uses md5/sha1 or an unknown algorithm"),
+    "record_no_hash": ("warn", "RECORD row has no hash"),
+    "bad_entry_point": ("error", "entry_points.txt line does not parse"),
+    # metadata (wheel METADATA and sdist PKG-INFO)
+    "name_mismatch": ("error", "metadata Name disagrees with the filename"),
+    "version_mismatch": ("error", "metadata Version disagrees with the filename"),
+    "version_not_pep440": ("error", "Version is not canonical PEP 440"),
+    "local_version": ("error", "Version has a +local segment; PyPI rejects it"),
+    "dev_version": ("warn", "Version is a .dev release"),
+    "no_summary": ("warn", "no Summary"),
+    "no_requires_python": ("warn", "no Requires-Python"),
+    "no_license_metadata": ("warn", "no License, License-Expression or License classifier"),
+    "license_conflict": ("error", "both License and License-Expression set; PyPI rejects this (PEP 639)"),
+    "license_classifier_with_expression": ("warn", "License :: classifiers alongside License-Expression (PEP 639)"),
+    "license_file_missing": ("error", "a License-File is not in the archive (PEP 639)"),
+    "no_long_description": ("warn", "no long description"),
+    "no_content_type": ("warn", "long description has no Description-Content-Type"),
+    "bad_content_type": ("warn", "Description-Content-Type is not text/plain, text/x-rst or text/markdown"),
+    "direct_url_dependency": ("error", "Requires-Dist uses a direct URL; PyPI rejects it"),
+    "bad_project_url": ("warn", "Project-URL/Home-page is not 'Label, https://...'"),
+    "old_metadata_version": ("warn", "Metadata-Version older than 2.1"),
+    "bad_metadata_version": ("error", "unparseable Metadata-Version"),
+    # sdist structure
+    "sdist_no_root": ("error", "sdist does not have exactly one top-level directory"),
+    "sdist_root_mismatch": ("warn", "sdist top-level dir is not {name}-{version}"),
+    "sdist_name_not_normalized": ("warn", "sdist filename project part is not normalized (PEP 625)"),
+    "sdist_no_build_config": ("error", "sdist has neither pyproject.toml nor setup.py"),
+    "sdist_no_pkg_info": ("error", "sdist lacks PKG-INFO"),
+    "sdist_no_version": ("error", "PKG-INFO has no Version"),
+    "sdist_no_license_file": ("warn", "no LICENSE/COPYING file in the sdist"),
+    "sdist_version": ("info", "the version found in PKG-INFO"),
+    # cross-artifact
+    "version_drift": ("error", "artifacts disagree on version"),
+    "name_drift": ("error", "artifacts are for different projects"),
+    "metadata_drift": ("warn", "wheel and sdist metadata disagree (dependencies, Requires-Python...)"),
+}
+
+# Codes that can never be silenced: ignoring them would let a broken or empty
+# release pass, so the gate has to stay closed.
+UNIGNORABLE = {"no_artifacts", "wheel_corrupt", "sdist_corrupt", "wheel_no_dist_info",
+               "sdist_no_pkg_info", "member_unreadable"}
 
 
 @dataclass(frozen=True)
@@ -30,13 +139,24 @@ class Finding:
     severity: str  # error | warn | info
     code: str
     message: str
+    file: str = ""
 
     def as_dict(self):
-        return {"severity": self.severity, "code": self.code, "message": self.message}
+        return {"severity": self.severity, "code": self.code,
+                "message": self.message, "file": self.file}
+
+
+def _f(code: str, message: str, file: str = "") -> Finding:
+    return Finding(CHECKS[code][0], code, message, file)
 
 
 def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def filename_normalize(name: str) -> str:
+    """Project name as it must appear in wheel/sdist filenames."""
+    return re.sub(r"[-_.]+", "_", name).lower()
 
 
 def parse_metadata(text: str) -> email.message.Message:
@@ -45,144 +165,626 @@ def parse_metadata(text: str) -> email.message.Message:
     return email.parser.Parser().parsestr(text)
 
 
-def check_wheel(path: str) -> List[Finding]:
-    out: List[Finding] = []
+# --- metadata checks shared by wheel METADATA and sdist PKG-INFO ----------
+
+def _long_description(meta: email.message.Message) -> str:
+    body = meta.get_payload()
+    if isinstance(body, str) and body.strip():
+        return body
+    return meta.get("Description", "") or ""
+
+
+def _md_version(meta: email.message.Message) -> Tuple[int, int]:
     try:
-        zf = zipfile.ZipFile(path)
-    except zipfile.BadZipFile:
-        return [Finding("error", "wheel_corrupt", f"{os.path.basename(path)} is not a valid zip")]
-    with zf:
-        names = zf.namelist()
-        dist_infos = [n for n in names if n.endswith(".dist-info/METADATA")]
-        if len(dist_infos) != 1:
-            return [Finding("error", "wheel_no_dist_info", f"{os.path.basename(path)}: expected exactly one .dist-info/METADATA")]
-        meta_path = dist_infos[0]
-        dist_dir = meta_path.rsplit("/", 1)[0]
-        meta = parse_metadata(zf.read(meta_path).decode("utf-8", "replace"))
+        major, minor = (meta.get("Metadata-Version") or "0.0").strip().split(".")[:2]
+        return int(major), int(minor)
+    except ValueError:
+        return (0, 0)
 
-        fname = os.path.basename(path)
-        parts = fname.split("-")
-        file_proj, file_ver = parts[0], parts[1] if len(parts) > 1 else ""
 
-        name, version = meta.get("Name", ""), meta.get("Version", "")
-        if normalize(name) != normalize(file_proj.replace("_", "-")):
-            out.append(Finding("error", "name_mismatch",
-                              f"METADATA Name {name!r} != filename project {file_proj!r}"))
-        if version != file_ver:
-            out.append(Finding("error", "version_mismatch",
-                              f"METADATA Version {version!r} != filename version {file_ver!r}"))
-        if not PEP440.match(version or ""):
-            out.append(Finding("error", "version_not_pep440", f"Version {version!r} is not PEP 440"))
-        if "+" in (version or ""):
-            out.append(Finding("error", "local_version", f"Version {version!r} has a local segment; PyPI rejects it"))
-        if ".dev" in (version or ""):
-            out.append(Finding("warn", "dev_version", f"Version {version!r} is a dev release"))
-        if not meta.get("Summary"):
-            out.append(Finding("warn", "no_summary", "METADATA has no Summary"))
-        if not meta.get("Requires-Python"):
-            out.append(Finding("warn", "no_requires_python", "METADATA has no Requires-Python"))
-        if not meta.get("License") and not any(k.startswith("License") for k in meta):
-            if not any("License" in c for c in meta.get_all("Classifier", [])):
-                out.append(Finding("warn", "no_license_metadata", "no License field or License :: classifier"))
-        if not any(k.startswith("Description") or k == "Description-Content-Type" for k in meta):
-            body = zf.read(meta_path).decode("utf-8", "replace")
-            if body.count("\n\n") == 0:
-                out.append(Finding("warn", "no_long_description", "METADATA has no long description body"))
-        if not meta.get("Description-Content-Type") and "\n\n" in zf.read(meta_path).decode("utf-8", "replace"):
-            out.append(Finding("warn", "no_content_type",
-                              "long description present but no Description-Content-Type; PyPI may render it as plain text"))
+def _url_ok(url: str) -> bool:
+    return bool(re.match(r"^https?://[^\s/$.?#][^\s]*$", url.strip(), re.IGNORECASE))
 
-        md_ver = meta.get("Metadata-Version", "")
-        try:
-            if tuple(int(x) for x in md_ver.split(".")[:2]) < (2, 1):
-                out.append(Finding("warn", "old_metadata_version", f"Metadata-Version {md_ver} is old; use >= 2.1"))
-        except ValueError:
-            out.append(Finding("error", "bad_metadata_version", f"unparseable Metadata-Version {md_ver!r}"))
 
-        if f"{dist_dir}/WHEEL" not in names:
-            out.append(Finding("error", "no_wheel_file", f"{dist_dir}/WHEEL missing"))
-        else:
-            wheel_meta = parse_metadata(zf.read(f"{dist_dir}/WHEEL").decode("utf-8", "replace"))
-            if not wheel_meta.get("Wheel-Version"):
-                out.append(Finding("error", "wheel_no_version", "WHEEL file lacks Wheel-Version"))
-        if f"{dist_dir}/RECORD" not in names:
-            out.append(Finding("error", "no_record", f"{dist_dir}/RECORD missing"))
-        else:
-            record_lines = [l for l in zf.read(f"{dist_dir}/RECORD").decode("utf-8", "replace").splitlines() if l.strip()]
-            listed = {l.split(",", 1)[0] for l in record_lines}
-            missing = [n for n in names if n not in listed and not n.endswith("/")]
-            if missing:
-                out.append(Finding("warn", "record_incomplete",
-                                  f"{len(missing)} file(s) absent from RECORD (e.g. {missing[0]})"))
+def check_metadata(meta: email.message.Message, label: str,
+                   members: Set[str], license_root: str) -> List[Finding]:
+    """Checks PyPI applies to metadata regardless of artifact type.
 
-        ep_path = f"{dist_dir}/entry_points.txt"
-        if ep_path in names:
-            ep_text = zf.read(ep_path).decode("utf-8", "replace")
-            section = None
-            for line in ep_text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("[") and line.endswith("]"):
-                    section = line[1:-1]
-                    continue
-                if "=" not in line or not ENTRY_POINT.match(line):
-                    out.append(Finding("error", "bad_entry_point", f"unparseable entry point: {line!r}"))
+    `members` is the archive's member names; `license_root` is where
+    License-File paths resolve ("x.dist-info/licenses/" or "x-1.0/").
+    """
+    out: List[Finding] = []
+    version = meta.get("Version", "") or ""
+    if not PEP440.match(version):
+        out.append(_f("version_not_pep440", f"Version {version!r} is not PEP 440", label))
+    if "+" in version:
+        out.append(_f("local_version", f"Version {version!r} has a local segment; PyPI rejects it", label))
+    if ".dev" in version:
+        out.append(_f("dev_version", f"Version {version!r} is a dev release", label))
+    if not meta.get("Summary"):
+        out.append(_f("no_summary", "metadata has no Summary", label))
+    if not meta.get("Requires-Python"):
+        out.append(_f("no_requires_python", "metadata has no Requires-Python", label))
+
+    has_license = bool(meta.get("License"))
+    has_expr = bool(meta.get("License-Expression"))
+    license_classifiers = [c for c in meta.get_all("Classifier", []) if c.startswith("License ::")]
+    if has_license and has_expr:
+        out.append(_f("license_conflict",
+                      "both License and License-Expression are set; PyPI rejects this (PEP 639)", label))
+    if has_expr and license_classifiers:
+        out.append(_f("license_classifier_with_expression",
+                      f"{len(license_classifiers)} License :: classifier(s) alongside License-Expression", label))
+    any_license_classifier = any("License" in c for c in meta.get_all("Classifier", []))
+    if not (has_license or has_expr or any_license_classifier):
+        out.append(_f("no_license_metadata", "no License, License-Expression or License :: classifier", label))
+    # License-File placement is only specified from Metadata 2.4 (PEP 639);
+    # older setuptools put the files elsewhere, so don't second-guess them.
+    for lf in meta.get_all("License-File", []) if _md_version(meta) >= (2, 4) else []:
+        lf = lf.strip()
+        if lf and (unsafe_path_reason(lf) or license_root + lf not in members):
+            out.append(_f("license_file_missing",
+                          f"License-File {lf!r} is not at {license_root}{lf}", label))
+
+    desc = _long_description(meta)
+    dct = (meta.get("Description-Content-Type") or "").strip()
+    if not desc.strip():
+        out.append(_f("no_long_description", "metadata has no long description", label))
+    elif not dct:
+        out.append(_f("no_content_type",
+                      "long description present but no Description-Content-Type; "
+                      "PyPI may render it as plain text", label))
+    if dct and dct.split(";")[0].strip().lower() not in CONTENT_TYPES:
+        out.append(_f("bad_content_type", f"Description-Content-Type {dct!r} is not one PyPI renders", label))
+
+    for req in meta.get_all("Requires-Dist", []):
+        spec = req.split(";", 1)[0]
+        if "@" in spec:
+            out.append(_f("direct_url_dependency",
+                          f"Requires-Dist {req.strip()!r} is a direct URL; PyPI rejects "
+                          "\"Can't have direct dependency\"", label))
+    for pu in meta.get_all("Project-URL", []):
+        lab, sep, url = pu.partition(",")
+        if not sep or not lab.strip() or not _url_ok(url):
+            out.append(_f("bad_project_url", f"Project-URL {pu.strip()!r} is not 'Label, https://...'", label))
+    home = meta.get("Home-page")
+    if home and home.strip().upper() != "UNKNOWN" and not _url_ok(home):
+        out.append(_f("bad_project_url", f"Home-page {home.strip()!r} is not an http(s) URL", label))
+
+    md_ver = meta.get("Metadata-Version", "") or ""
+    try:
+        if tuple(int(x) for x in md_ver.split(".")[:2]) < (2, 1):
+            out.append(_f("old_metadata_version", f"Metadata-Version {md_ver} is old; use >= 2.1", label))
+    except ValueError:
+        out.append(_f("bad_metadata_version", f"unparseable Metadata-Version {md_ver!r}", label))
     return out
 
 
-def check_sdist(path: str) -> List[Finding]:
+# --- member-level checks shared by both archive types ---------------------
+
+def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
     out: List[Finding] = []
+    seen: Set[str] = set()
+    folded: Dict[str, str] = {}
+    dup_reported: Set[str] = set()
+    junk: Set[str] = set()
+    vcs = False
+    for n in names:
+        reason = unsafe_path_reason(n)
+        if reason:
+            out.append(_f("unsafe_path", f"member {n!r} {reason}", label))
+        key = n.rstrip("/")
+        if key in seen and key not in dup_reported:
+            dup_reported.add(key)
+            out.append(_f("duplicate_entry", f"{key!r} appears more than once", label))
+        elif key not in seen:
+            low = key.lower()
+            if low in folded and folded[low] != key:
+                out.append(_f("case_collision", f"{folded[low]!r} and {key!r} differ only by case", label))
+            folded.setdefault(low, key)
+        seen.add(key)
+        kind = sensitive_file_kind(key)
+        if kind and not path_allowed(key, allow):
+            out.append(_f("sensitive_file", f"{key!r} looks like a {kind}; it would be public on PyPI", label))
+        parts = key.split("/")
+        if any(p in VCS_DIRS for p in parts[:-1]) or parts[-1] in VCS_DIRS:
+            vcs = True
+        hit = next((p for p in parts if p in JUNK_DIRS), None) or (
+            parts[-1] if parts[-1] in JUNK_FILES else None)
+        if hit:
+            junk.add(hit)
+    if vcs:
+        out.append(_f("vcs_metadata_shipped", "version-control metadata (.git/.hg/.svn) is shipped", label))
+    if junk:
+        out.append(_f("junk_file", f"shipped junk: {', '.join(sorted(junk))}", label))
+    return out
+
+
+class _Budget:
+    def __init__(self, limit: Optional[int] = None):
+        self.left = MAX_ARCHIVE_READ if limit is None else limit
+        self.exhausted = False
+
+    def take(self, n: int) -> bool:
+        if n > self.left:
+            self.exhausted = True
+            return False
+        self.left -= n
+        return True
+
+
+def _read_capped(fp, cap: int) -> Optional[bytes]:
+    data = fp.read(cap + 1)
+    return None if len(data) > cap else data
+
+
+def _record_hash(fp, algo: str) -> Tuple[str, int]:
+    h = hashlib.new(algo)
+    size = 0
+    while True:
+        chunk = fp.read(CHUNK)
+        if not chunk:
+            break
+        size += len(chunk)
+        h.update(chunk)
+    return base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode("ascii"), size
+
+
+def _secret_findings(name: str, blob: bytes, label: str) -> List[Finding]:
+    kinds = scan_secrets(blob)
+    if not kinds:
+        return []
+    return [_f("secret_in_file", f"{name!r} contains what looks like a {', '.join(kinds)} "
+                                 "(value not shown); it would be public on PyPI", label)]
+
+
+# --- wheel -----------------------------------------------------------------
+
+def _wheel_filename(fname: str) -> Optional[Tuple[str, str, Set[str]]]:
+    if not fname.endswith(".whl"):
+        return None
+    parts = fname[:-4].split("-")
+    if len(parts) not in (5, 6):
+        return None
+    py, abi, plat = parts[-3:]
+    if len(parts) == 6 and not re.match(r"^\d", parts[2]):
+        return None
+    tags = {f"{a}-{b}-{c}" for a in py.split(".") for b in abi.split(".") for c in plat.split(".")}
+    return parts[0], parts[1], tags
+
+
+def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
+    """Audit one wheel. `allow` holds --allow-path globs exempt from the
+    credential/secret checks (for deliberate test fixtures)."""
+    out: List[Finding] = []
+    fname = os.path.basename(path)
     try:
-        tf = tarfile.open(path, "r:*")
-    except tarfile.TarError:
-        return [Finding("error", "sdist_corrupt", f"{os.path.basename(path)} is not a valid tarball")]
-    with tf:
-        members = tf.getnames()
-        top = {m.split("/", 1)[0] for m in members}
-        if len(top) != 1:
-            out.append(Finding("error", "sdist_no_root", "sdist should contain exactly one top-level directory"))
-        root = sorted(top)[0] if top else ""
-        has_build_file = any(m == f"{root}/pyproject.toml" or m == f"{root}/setup.py" for m in members)
-        if not has_build_file:
-            out.append(Finding("error", "sdist_no_build_config", "sdist contains neither pyproject.toml nor setup.py"))
-        pkg_info = next((m for m in members if m == f"{root}/PKG-INFO"), None)
-        if not pkg_info:
-            out.append(Finding("error", "sdist_no_pkg_info", "sdist lacks PKG-INFO"))
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError, ValueError, EOFError):
+        return [_f("wheel_corrupt", f"{fname} is not a valid zip", fname)]
+    with zf:
+        infos = zf.infolist()
+        names = [i.filename for i in infos]
+        out.extend(check_member_names(names, fname, allow))
+        files = [i for i in infos if not i.is_dir()]
+        member_set = {i.filename for i in files}
+
+        parsed = _wheel_filename(fname)
+        if not parsed:
+            out.append(_f("bad_wheel_filename", f"{fname!r} is not name-version[-build]-py-abi-plat.whl", fname))
+            file_proj = fname.split("-")[0]
+            file_ver = fname.split("-")[1] if "-" in fname else ""
+            file_tags: Set[str] = set()
         else:
-            meta = parse_metadata(tf.extractfile(pkg_info).read().decode("utf-8", "replace"))
-            if not meta.get("Version"):
-                out.append(Finding("error", "sdist_no_version", "PKG-INFO has no Version"))
-            out.append(Finding("info", "sdist_version", f"PKG-INFO version {meta.get('Version')}"))
-        if not any("LICENSE" in m.upper() or "COPYING" in m.upper() for m in members):
-            out.append(Finding("warn", "sdist_no_license_file", "no LICENSE/COPYING file in the sdist"))
+            file_proj, file_ver, file_tags = parsed
+            if file_proj != filename_normalize(file_proj):
+                out.append(_f("wheel_name_not_normalized",
+                              f"filename project {file_proj!r} should be {filename_normalize(file_proj)!r}", fname))
+
+        metas = [n for n in member_set
+                 if n.endswith(".dist-info/METADATA") and n.count("/") == 1]
+        if len(metas) != 1:
+            out.append(_f("wheel_no_dist_info", f"{fname}: expected exactly one top-level .dist-info/METADATA", fname))
+            return out
+        meta_path = metas[0]
+        dist_dir = meta_path.rsplit("/", 1)[0]
+
+        def read_small(member: str) -> Optional[str]:
+            try:
+                with zf.open(member) as fp:
+                    data = _read_capped(fp, MAX_METADATA_BYTES)
+            except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+                out.append(_f("member_unreadable", f"{member!r}: {type(e).__name__}", fname))
+                return None
+            if data is None:
+                out.append(_f("member_unreadable", f"{member!r} exceeds {MAX_METADATA_BYTES} bytes", fname))
+                return None
+            return data.decode("utf-8", "replace")
+
+        text = read_small(meta_path)
+        if text is None:
+            return out
+        meta = parse_metadata(text)
+        name, version = meta.get("Name", "") or "", meta.get("Version", "") or ""
+        if normalize(name) != normalize(file_proj):
+            out.append(_f("name_mismatch", f"METADATA Name {name!r} != filename project {file_proj!r}", fname))
+        if version != file_ver:
+            out.append(_f("version_mismatch", f"METADATA Version {version!r} != filename version {file_ver!r}", fname))
+        out.extend(check_metadata(meta, fname, member_set, f"{dist_dir}/licenses/"))
+
+        # WHEEL file and tags
+        if f"{dist_dir}/WHEEL" not in member_set:
+            out.append(_f("no_wheel_file", f"{dist_dir}/WHEEL missing", fname))
+        else:
+            wtext = read_small(f"{dist_dir}/WHEEL")
+            if wtext is not None:
+                wheel_meta = parse_metadata(wtext)
+                if not wheel_meta.get("Wheel-Version"):
+                    out.append(_f("wheel_no_version", "WHEEL file lacks Wheel-Version", fname))
+                wtags = {t.strip() for t in wheel_meta.get_all("Tag", []) if t.strip()}
+                if file_tags and wtags and wtags != file_tags:
+                    out.append(_f("wheel_tag_mismatch",
+                                  f"WHEEL tags {sorted(wtags)} != filename tags {sorted(file_tags)}", fname))
+        if file_tags and all(t.endswith("-none-any") for t in file_tags):
+            binaries = sorted(n for n in member_set if BINARY_EXT.search(n))
+            if binaries:
+                out.append(_f("binary_in_pure_wheel",
+                              f"{len(binaries)} compiled file(s) in a none-any wheel (e.g. {binaries[0]!r}); "
+                              "it will install on platforms it cannot run on", fname))
+        pyc = [n for n in member_set if n.endswith((".pyc", ".pyo")) or "/__pycache__/" in f"/{n}"]
+        if pyc:
+            out.append(_f("bytecode_shipped", f"{len(pyc)} bytecode file(s) shipped (e.g. {pyc[0]!r})", fname))
+
+        # RECORD: every listed file exists with matching sha256 and size
+        budget = _Budget()
+        record_path = f"{dist_dir}/RECORD"
+        hashed: Set[str] = set()
+        if record_path not in member_set:
+            out.append(_f("no_record", f"{record_path} missing", fname))
+        else:
+            rtext = read_small(record_path)
+            if rtext is not None:
+                listed: Set[str] = set()
+                unhashed: List[str] = []
+                problems = {"record_missing_file": [], "record_hash_mismatch": [],
+                            "record_size_mismatch": [], "record_weak_hash": []}
+                for row in csv.reader(io.StringIO(rtext)):
+                    if not row or not row[0].strip():
+                        continue
+                    rpath = row[0]
+                    listed.add(rpath)
+                    rhash = row[1].strip() if len(row) > 1 else ""
+                    rsize = row[2].strip() if len(row) > 2 else ""
+                    if rpath == record_path or rpath.startswith(f"{dist_dir}/RECORD."):
+                        continue  # RECORD itself and its signatures carry no hash
+                    if rpath not in member_set:
+                        problems["record_missing_file"].append(rpath)
+                        continue
+                    if not rhash:
+                        unhashed.append(rpath)
+                        continue
+                    algo, _, digest = rhash.partition("=")
+                    algo = algo.lower()
+                    if algo not in {"sha256", "sha384", "sha512"}:
+                        problems["record_weak_hash"].append(rpath)
+                        continue
+                    if not budget.take(zf.getinfo(rpath).file_size):
+                        continue
+                    try:
+                        with zf.open(rpath) as fp:
+                            actual, size = _record_hash(fp, algo)
+                    except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+                        out.append(_f("member_unreadable", f"{rpath!r}: {type(e).__name__}", fname))
+                        continue
+                    hashed.add(rpath)
+                    if actual != digest:
+                        problems["record_hash_mismatch"].append(rpath)
+                    if rsize and rsize != str(size):
+                        problems["record_size_mismatch"].append(rpath)
+                why = {
+                    "record_missing_file": "listed in RECORD but not in the wheel",
+                    "record_hash_mismatch": "content differs from its RECORD sha256 (changed after build?)",
+                    "record_size_mismatch": "size differs from RECORD",
+                    "record_weak_hash": "hashed with md5/sha1 or an unknown algorithm",
+                }
+                for code, paths in problems.items():
+                    if paths:
+                        out.append(_f(code, f"{len(paths)} file(s) {why[code]} (e.g. {paths[0]!r})", fname))
+                if unhashed:
+                    out.append(_f("record_no_hash", f"{len(unhashed)} RECORD row(s) without a hash "
+                                                    f"(e.g. {unhashed[0]!r})", fname))
+                missing = sorted(n for n in member_set if n not in listed)
+                if missing:
+                    out.append(_f("record_incomplete",
+                                  f"{len(missing)} file(s) absent from RECORD (e.g. {missing[0]!r})", fname))
+
+        # leaked secrets (bounded scan of every small file)
+        for info in files:
+            if path_allowed(info.filename, allow):
+                continue
+            if info.file_size > MAX_SCAN_BYTES or not budget.take(info.file_size):
+                continue
+            try:
+                with zf.open(info) as fp:
+                    blob = _read_capped(fp, MAX_SCAN_BYTES)
+            except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+                out.append(_f("member_unreadable", f"{info.filename!r}: {type(e).__name__}", fname))
+                continue
+            if blob:
+                out.extend(_secret_findings(info.filename, blob, fname))
+        if budget.exhausted:
+            out.append(_f("archive_too_large",
+                          f"more than {MAX_ARCHIVE_READ} bytes of content; hash/secret checks are partial", fname))
+
+        # entry points
+        ep_path = f"{dist_dir}/entry_points.txt"
+        if ep_path in member_set:
+            ep_text = read_small(ep_path) or ""
+            for line in ep_text.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    continue
+                if not ENTRY_POINT.match(line):
+                    out.append(_f("bad_entry_point", f"unparseable entry point: {line!r}", fname))
+    return out
+
+
+def wheel_metadata(path: str) -> Optional[email.message.Message]:
+    """METADATA of a wheel, or None if it cannot be read safely."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            metas = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA") and n.count("/") == 1]
+            if len(metas) != 1:
+                return None
+            with zf.open(metas[0]) as fp:
+                data = _read_capped(fp, MAX_METADATA_BYTES)
+    except Exception:  # noqa: BLE001 - corrupt input is already reported by check_wheel
+        return None
+    return parse_metadata(data.decode("utf-8", "replace")) if data is not None else None
+
+
+# --- sdist -----------------------------------------------------------------
+
+_SDIST_NAME = re.compile(r"^(?P<name>.+)-(?P<version>[^-]+)\.tar\.gz$")
+
+
+def _open_tar(path: str):
+    return tarfile.open(path, "r:*")
+
+
+def check_sdist(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
+    out: List[Finding] = []
+    fname = os.path.basename(path)
+    try:
+        tf = _open_tar(path)
+        with tf:
+            members = tf.getmembers()
+            return out + _check_sdist_members(tf, members, fname, allow)
+    except (tarfile.TarError, OSError, EOFError, zlib.error, ValueError) as e:
+        return [_f("sdist_corrupt", f"{fname} is not a valid tarball ({type(e).__name__})", fname)]
+
+
+def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fname: str,
+                         allow: Tuple[str, ...] = ()) -> List[Finding]:
+    out: List[Finding] = []
+    for m in members:  # some old tools prefix every member with "./"
+        while m.name.startswith("./"):
+            m.name = m.name[2:]
+    members = [m for m in members if m.name not in ("", ".")]
+    names = [m.name for m in members]
+    out.extend(check_member_names(names, fname, allow))
+    for m in members:
+        if m.issym() or m.islnk():
+            if link_escapes(m.name, m.linkname) or (m.islnk() and unsafe_path_reason(m.linkname)):
+                out.append(_f("unsafe_link", f"{m.name!r} links to {m.linkname!r}", fname))
+        elif not (m.isfile() or m.isdir()):
+            out.append(_f("special_file", f"{m.name!r} is not a regular file or directory", fname))
+
+    top = {n.split("/", 1)[0] for n in names if n not in ("", ".")}
+    if len(top) != 1:
+        out.append(_f("sdist_no_root", "sdist should contain exactly one top-level directory", fname))
+    root = sorted(top)[0] if top else ""
+    name_set = set(names)
+    file_set = {m.name for m in members if m.isfile()}
+
+    m = _SDIST_NAME.match(fname)
+    file_proj, file_ver = (m.group("name"), m.group("version")) if m else ("", "")
+    if m and file_proj != filename_normalize(file_proj):
+        out.append(_f("sdist_name_not_normalized",
+                      f"filename project {file_proj!r} should be {filename_normalize(file_proj)!r} (PEP 625)", fname))
+    if m and root and root != f"{file_proj}-{file_ver}":
+        out.append(_f("sdist_root_mismatch", f"top-level dir {root!r} != {file_proj}-{file_ver}", fname))
+
+    if not ({f"{root}/pyproject.toml", f"{root}/setup.py"} & name_set):
+        out.append(_f("sdist_no_build_config", "sdist contains neither pyproject.toml nor setup.py", fname))
+
+    budget = _Budget()
+    pkg_info = f"{root}/PKG-INFO"
+    if pkg_info not in file_set:
+        out.append(_f("sdist_no_pkg_info", "sdist lacks PKG-INFO", fname))
+    else:
+        fp = tf.extractfile(pkg_info)
+        data = _read_capped(fp, MAX_METADATA_BYTES) if fp else None
+        if data is None:
+            out.append(_f("member_unreadable", f"{pkg_info!r} is unreadable or too large", fname))
+        else:
+            meta = parse_metadata(data.decode("utf-8", "replace"))
+            version = meta.get("Version")
+            if not version:
+                out.append(_f("sdist_no_version", "PKG-INFO has no Version", fname))
+            out.append(_f("sdist_version", f"PKG-INFO version {version}", fname))
+            if m and meta.get("Name") and normalize(meta.get("Name")) != normalize(file_proj):
+                out.append(_f("name_mismatch", f"PKG-INFO Name {meta.get('Name')!r} != filename project "
+                                               f"{file_proj!r}", fname))
+            if m and version and version != file_ver:
+                out.append(_f("version_mismatch", f"PKG-INFO Version {version!r} != filename version "
+                                                  f"{file_ver!r}", fname))
+            # License-File checks only: other metadata rules are reported on the wheel,
+            # and PKG-INFO below Metadata-Version 2.2 is not authoritative.
+            for lf in meta.get_all("License-File", []) if _md_version(meta) >= (2, 4) else []:
+                lf = lf.strip()
+                if lf and (unsafe_path_reason(lf) or f"{root}/{lf}" not in file_set):
+                    out.append(_f("license_file_missing", f"License-File {lf!r} is not at {root}/{lf}", fname))
+            for req in meta.get_all("Requires-Dist", []):
+                if "@" in req.split(";", 1)[0]:
+                    out.append(_f("direct_url_dependency",
+                                  f"Requires-Dist {req.strip()!r} is a direct URL; PyPI rejects it", fname))
+            if meta.get("License") and meta.get("License-Expression"):
+                out.append(_f("license_conflict",
+                              "both License and License-Expression are set; PyPI rejects this (PEP 639)", fname))
+
+    if not any(re.search(r"(LICEN[CS]E|COPYING)", n.rsplit("/", 1)[-1].upper()) for n in file_set):
+        out.append(_f("sdist_no_license_file", "no LICENSE/COPYING file in the sdist", fname))
+
+    for mem in members:
+        if not mem.isfile() or path_allowed(mem.name, allow):
+            continue
+        if mem.size > MAX_SCAN_BYTES or not budget.take(mem.size):
+            continue
+        fp = tf.extractfile(mem)
+        blob = _read_capped(fp, MAX_SCAN_BYTES) if fp else None
+        if blob:
+            out.extend(_secret_findings(mem.name, blob, fname))
+    if budget.exhausted:
+        out.append(_f("archive_too_large",
+                      f"more than {MAX_ARCHIVE_READ} bytes of content; secret scan is partial", fname))
+    return out
+
+
+def sdist_metadata(path: str) -> Optional[email.message.Message]:
+    try:
+        with _open_tar(path) as tf:
+            for mem in tf:
+                name = mem.name
+                while name.startswith("./"):
+                    name = name[2:]
+                if mem.isfile() and name.count("/") == 1 and name.endswith("/PKG-INFO"):
+                    fp = tf.extractfile(mem)
+                    data = _read_capped(fp, MAX_METADATA_BYTES) if fp else None
+                    return parse_metadata(data.decode("utf-8", "replace")) if data is not None else None
+    except Exception:  # noqa: BLE001 - corrupt input is already reported by check_sdist
+        return None
+    return None
+
+
+# --- cross-artifact --------------------------------------------------------
+
+def _reqs(meta: email.message.Message) -> Set[str]:
+    return {re.sub(r"\s+", "", r).lower() for r in meta.get_all("Requires-Dist", [])}
+
+
+def check_drift(wheel_metas: List[Tuple[str, email.message.Message]],
+                sdist_metas: List[Tuple[str, email.message.Message]]) -> List[Finding]:
+    out: List[Finding] = []
+    for sname, smeta in sdist_metas:
+        try:
+            md = tuple(int(x) for x in (smeta.get("Metadata-Version") or "0").split(".")[:2])
+        except ValueError:
+            continue
+        if md < (2, 2):
+            continue  # PKG-INFO fields are only trustworthy from Metadata 2.2 (PEP 643)
+        dynamic = {d.strip().lower() for d in smeta.get_all("Dynamic", [])}
+        for wname, wmeta in wheel_metas:
+            diffs = []
+            if "requires-python" not in dynamic and (smeta.get("Requires-Python") or "") != (wmeta.get("Requires-Python") or ""):
+                diffs.append("Requires-Python")
+            if "requires-dist" not in dynamic and _reqs(smeta) != _reqs(wmeta):
+                diffs.append("Requires-Dist")
+            if "summary" not in dynamic and (smeta.get("Summary") or "") != (wmeta.get("Summary") or ""):
+                diffs.append("Summary")
+            if diffs:
+                out.append(_f("metadata_drift", f"{wname} and {sname} disagree on {', '.join(diffs)}", wname))
+    return out
+
+
+def _iter_artifacts(paths: Iterable[str]) -> Tuple[List[str], List[str], List[str], List[str]]:
+    wheels, sdists, zips, dirs = [], [], [], []
+    for p in paths:
+        if os.path.isdir(p):
+            dirs.append(p)
+            for f in sorted(os.listdir(p)):
+                full = os.path.join(p, f)
+                if not os.path.isfile(full):
+                    continue
+                if f.endswith(".whl"):
+                    wheels.append(full)
+                elif f.endswith(".tar.gz"):
+                    sdists.append(full)
+                elif f.endswith(".zip"):
+                    zips.append(full)
+        elif os.path.isfile(p):
+            if p.endswith(".whl"):
+                wheels.append(p)
+            elif p.endswith(".tar.gz"):
+                sdists.append(p)
+            elif p.endswith(".zip"):
+                zips.append(p)
+            else:
+                raise ValueError(f"not a wheel, sdist or directory: {p}")
+        else:
+            raise FileNotFoundError(p)
+    return wheels, sdists, zips, dirs
+
+
+def diagnose(paths: Iterable[str], allow: Iterable[str] = ()) -> List[Finding]:
+    """Diagnose artifacts given as files and/or directories of artifacts.
+
+    `allow` is a list of member-path globs (e.g. "tests/certs/*") exempt
+    from the credential-file and secret checks only.
+    """
+    paths = list(paths)
+    allow = tuple(allow)
+    wheels, sdists, zips, _ = _iter_artifacts(paths)
+    out: List[Finding] = []
+    if not wheels and not sdists:
+        where = ", ".join(paths) or "(nothing)"
+        out.append(_f("no_artifacts", f"no .whl or .tar.gz files in {where}"))
+        for z in zips:
+            out.append(_f("sdist_zip_format", "zip sdists are not standard; build a .tar.gz", os.path.basename(z)))
+        return out
+    if not wheels:
+        out.append(_f("missing_wheel", "no wheel built; pip will fall back to the sdist"))
+    if not sdists:
+        out.append(_f("missing_sdist", "no sdist built; PyPI encourages shipping one"))
+    for z in zips:
+        out.append(_f("sdist_zip_format", "zip sdists are not standard (PEP 625); build a .tar.gz",
+                      os.path.basename(z)))
+
+    versions: Set[str] = set()
+    projects: Set[str] = set()
+    wheel_metas, sdist_metas = [], []
+    for w in wheels:
+        out.extend(check_wheel(w, allow))
+        parts = os.path.basename(w).split("-")
+        if len(parts) > 1:
+            projects.add(normalize(parts[0]))
+            versions.add(parts[1])
+        meta = wheel_metadata(w)
+        if meta is not None:
+            wheel_metas.append((os.path.basename(w), meta))
+    for s in sdists:
+        out.extend(check_sdist(s, allow))
+        m = _SDIST_NAME.match(os.path.basename(s))
+        if m:
+            projects.add(normalize(m.group("name")))
+            versions.add(m.group("version"))
+        meta = sdist_metadata(s)
+        if meta is not None:
+            sdist_metas.append((os.path.basename(s), meta))
+    if len(projects) > 1:
+        out.append(_f("name_drift", f"artifacts are for different projects: {sorted(projects)}"))
+    if len(versions) > 1:
+        out.append(_f("version_drift", f"artifacts disagree on version: {sorted(versions)}"))
+    out.extend(check_drift(wheel_metas, sdist_metas))
     return out
 
 
 def diagnose_dist_dir(dist_dir: str) -> List[Finding]:
     """Diagnose every artifact in a dist directory, plus cross-artifact checks."""
-    wheels = sorted(f for f in os.listdir(dist_dir) if f.endswith(".whl"))
-    sdists = sorted(f for f in os.listdir(dist_dir) if f.endswith(".tar.gz"))
-    out: List[Finding] = []
-    if not wheels and not sdists:
-        return [Finding("error", "no_artifacts", f"no .whl or .tar.gz files in {dist_dir}")]
-    if not wheels:
-        out.append(Finding("warn", "missing_wheel", "no wheel built; pip will fall back to the sdist"))
-    if not sdists:
-        out.append(Finding("warn", "missing_sdist", "no sdist built; PyPI encourages shipping one"))
-
-    versions = set()
-    for w in wheels:
-        out.extend(check_wheel(os.path.join(dist_dir, w)))
-        parts = w.split("-")
-        if len(parts) > 1:
-            versions.add(parts[1])
-    for s in sdists:
-        out.extend(check_sdist(os.path.join(dist_dir, s)))
-        # <name>-<version>.tar.gz
-        m = re.match(r"^.+-(\d[^-]*)\.tar\.gz$", s)
-        if m:
-            versions.add(m.group(1))
-    if len(versions) > 1:
-        out.append(Finding("error", "version_drift", f"artifacts disagree on version: {sorted(versions)}"))
-    return out
+    if not os.path.isdir(dist_dir):
+        if not os.path.exists(dist_dir):
+            raise FileNotFoundError(dist_dir)
+        raise NotADirectoryError(dist_dir)
+    return diagnose([dist_dir])
