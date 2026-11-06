@@ -18,8 +18,9 @@ WHL = "demo-1.0.0-py3-none-any.whl"
 DIST = "demo-1.0.0.dist-info"
 
 # Fake secrets are assembled at runtime so no contiguous token sits in the repo.
-FAKE_GH = "gh" + "p_" + "a1B2" * 9
-FAKE_AWS = "AK" + "IA" + "Q" * 16
+_MIX = "".join(chr(c) for c in range(ord("a"), ord("z") + 1)) + "0123456789"
+FAKE_GH = "gh" + "p_" + (_MIX[::-1] * 2)[:36]
+FAKE_AWS = "AK" + "IA" + "QW7RT3YP9ZUX2NBV"
 FAKE_KEY = ("-----BEGIN " + "PRIVATE KEY-----\n" + ("MIIB" + "x" * 60 + "\n") * 3
             + "-----END " + "PRIVATE KEY-----\n")
 
@@ -289,7 +290,8 @@ def test_content_type_and_urls(tmp_path):
     p = make_wheel(tmp_path, extra_meta="Project-URL: Source, javascript:alert(1)\n"
                                         "Project-URL: no-comma-here\n"
                                         "Project-URL: Docs, https://example.com/docs\n")
-    assert codes(check_wheel(p)).count("bad_project_url") == 2
+    found = codes(check_wheel(p))
+    assert found.count("bad_project_url") == 1 and found.count("project_url_rejected") == 1
 
 
 def test_local_version_reported_once(tmp_path):
@@ -405,4 +407,5 @@ def test_dot_slash_prefixed_sdist(tmp_path):
         tinfo(f"./{root}/PKG-INFO", b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\n"),
         tinfo(f"./{root}/pyproject.toml", b""), tinfo(f"./{root}/LICENSE", b"MIT"),
     ])
-    assert [f.code for f in check_sdist(p) if f.severity != "info"] == []
+    # PyPI rejects "./" members; structure checks still see the real layout
+    assert [f.code for f in check_sdist(p) if f.severity != "info"] == ["path_not_normalized"]

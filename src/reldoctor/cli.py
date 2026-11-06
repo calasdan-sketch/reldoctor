@@ -8,8 +8,9 @@ import sys
 from typing import List
 
 from . import __version__
+from . import doctor
 from .doctor import CHECKS, UNIGNORABLE, Finding, diagnose
-from .safety import escape_terminal
+from .safety import check_allow_patterns, escape_terminal
 
 
 def _gh_escape(value: str, prop: bool = False) -> str:
@@ -64,6 +65,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--allow-path", action="append", default=[], metavar="GLOB",
                     help="exempt archive paths matching GLOB from the secret/credential checks "
                          "(e.g. 'tests/certs/*'); repeatable")
+    ap.add_argument("--max-members", type=int, default=doctor.DEFAULT_MAX_MEMBERS, metavar="N",
+                    help=f"refuse archives with more than N members (default {doctor.DEFAULT_MAX_MEMBERS})")
     ap.add_argument("--list-checks", action="store_true", help="print every check code and exit")
     ap.add_argument("--version", action="version", version=f"reldoctor {__version__}")
     args = ap.parse_args(argv)
@@ -87,13 +90,23 @@ def main(argv: List[str] | None = None) -> int:
         print(f"reldoctor: these checks cannot be ignored: {', '.join(locked)}", file=sys.stderr)
         return 2
 
-    bad_globs = [g for g in args.allow_path if not g.strip() or g.strip("*/") == ""]
-    if bad_globs:
-        print("reldoctor: --allow-path must name a path, not match everything", file=sys.stderr)
+    broad = check_allow_patterns(args.allow_path)
+    if broad:
+        for pat, example in broad:
+            print(f"reldoctor: --allow-path {escape_terminal(pat)!r} is too broad: it would also "
+                  f"exempt {example!r}. Name the fixture directory, e.g. 'tests/certs/*'",
+                  file=sys.stderr)
+        return 2
+    if args.max_members < 1:
+        print("reldoctor: --max-members must be at least 1", file=sys.stderr)
         return 2
 
     try:
-        findings = diagnose(args.paths, allow=args.allow_path)
+        saved, doctor.MAX_MEMBERS = doctor.MAX_MEMBERS, args.max_members
+        try:
+            findings = diagnose(args.paths, allow=args.allow_path)
+        finally:
+            doctor.MAX_MEMBERS = saved
     except FileNotFoundError as e:
         print(f"reldoctor: no such file or directory: {escape_terminal(str(e))}", file=sys.stderr)
         return 2

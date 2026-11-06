@@ -32,14 +32,14 @@ ERROR version_drift              artifacts disagree on version: ['1.4.0', '1.4.1
 
 ## What it checks
 
-`reldoctor --list-checks` prints all 60+ check codes with their severity. In groups:
+`reldoctor --list-checks` prints all 70+ check codes with their severity. In groups:
 
 | Area | Examples |
 |---|---|
-| **Will PyPI accept it?** | direct-URL `Requires-Dist` (PyPI: "Can't have direct dependency"), `License` + `License-Expression` together and missing `License-File`s (PEP 639), `+local` versions, non-PEP 440 versions, unknown `Description-Content-Type` |
-| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`; PEM private-key blocks, AWS key ids, GitHub, PyPI and Slack tokens inside files. Secret values are never printed |
-| **Integrity** | every RECORD row's sha256 and size against the real file, files missing from / extra to RECORD, md5/sha1 hashes, duplicate zip entries |
-| **Archive safety** | absolute, `..`, drive-letter and backslash member paths; sdist symlinks/hardlinks escaping the tree; device/FIFO members; names that collide on case-insensitive filesystems |
+| **Will PyPI accept it?** | rules taken from PyPI's own upload code (warehouse `forklift/legacy.py`, `forklift/metadata.py`) and `packaging.metadata`: direct URLs or unparseable PEP 508 strings in `Requires-`/`Provides-`/`Obsoletes-Dist`; unsupported `Metadata-Version`; `Description-Content-Type` type, charset and Markdown variant; `License` + `License-Expression` and missing `License-File`s (PEP 639); `+local` and over-long versions; Summary over 512 chars; Project-URL labels over 32 chars; non-normalized member paths (`a/./b`, `./a`); bzip2/lzma wheel members; zips over 50x ratio past 64 MiB; GNU sparse tar members |
+| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`; PEM private-key blocks, AWS key ids, GitHub, PyPI and Slack tokens inside files of any size (including content reached through sdist hardlinks). Documented examples and placeholders (`AKIAIOSFODNN7EXAMPLE`, `xoxb-your-token-here`) are ignored. Secret values and URL credentials are redacted from every message |
+| **Integrity** | every RECORD row's sha256 and size against the real file, files missing from / extra to RECORD, md5/sha1 hashes, malformed RECORD CSV, duplicate zip entries |
+| **Archive safety** | absolute, `..`, drive-letter and backslash member paths; sdist symlinks escaping the tree, following chains of links (`a -> ..`, `b -> a/..`); dangling hardlinks; device/FIFO members; names that collide on case-insensitive filesystems; symlink mode bits in wheels; a member cap (`--max-members`, default 100,000) |
 | **Wheel correctness** | filename format and normalization, WHEEL `Tag` vs filename, compiled `.so`/`.pyd` inside a `none-any` wheel, shipped bytecode, entry points (including `[extras]`) |
 | **Metadata quality** | Name/Version vs filename, Summary, Requires-Python, license, long description and content type, Project-URL format |
 | **Sdist** | single `{name}-{version}/` root, PEP 625 filename, `pyproject.toml`/`setup.py`, PKG-INFO, LICENSE/COPYING |
@@ -61,8 +61,9 @@ reldoctor dist/ --allow-path 'tests/certs/*' # deliberate test keys: exempt from
 Exit codes: `0` pass, `1` findings (errors, or warnings with `--strict`), `2` usage error.
 
 The gate fails closed: an empty `dist/` fails, an unknown `--ignore` code is a usage error,
-`--allow-path '*'` is refused, and a few checks (`no_artifacts`, corrupt archives,
-unreadable members, missing METADATA/PKG-INFO) cannot be ignored.
+an `--allow-path` glob broad enough to exempt ordinary source or credential files (`*`, `?*`,
+`*.*`, `*.py`, `*.pem`...) is refused, and some checks (`no_artifacts`, corrupt archives,
+unreadable members, malformed RECORD, too many members, missing METADATA/PKG-INFO) cannot be ignored.
 
 ### In CI
 
@@ -107,11 +108,14 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
 
 ## Honest limits
 
-- It inspects artifacts, not your source tree, and does not contact PyPI. Some PyPI rules
-  (name squatting, classifier validity, file-size quotas) are not checked.
-- The secret scan uses a few high-confidence patterns on files up to 2 MiB. It will miss
-  secrets in other formats and it will flag real-but-intentional test keys (for example
-  TLS test certificates); exempt those with `--allow-path`.
+- It inspects artifacts, not your source tree, and does not contact PyPI.
+- The secret scan uses a few high-confidence patterns. It will miss secrets in other
+  formats and it will flag real-but-intentional test keys (for example TLS test
+  certificates); exempt those with `--allow-path`.
+- PEP 508 requirement parsing is a stdlib re-implementation, differential-tested against
+  `packaging` on 111 requirement strings (all agree) but not guaranteed identical.
+- PyPI rules not checked: classifier validity, author email validity, name squatting,
+  file-size quotas, and its YARA malware scan.
 - Reads are bounded (16 MiB per metadata file, 1 GiB of content per archive); past that a
   `archive_too_large` warning says hash/secret coverage is partial.
 - Version checking accepts canonical PEP 440 only, so non-normalized spellings like `1.0-rc1` are flagged.

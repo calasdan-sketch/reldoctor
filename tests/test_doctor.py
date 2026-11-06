@@ -20,7 +20,8 @@ from reldoctor.doctor import (
 def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=None,
                extra_meta="", entry_points=None, include_record=True, corrupt=False,
                license_field="License: MIT", summary="A demo package",
-               requires_python=">=3.9", extra_files=None, metadata_version="2.1"):
+               requires_python=">=3.9", extra_files=None, metadata_version="2.1",
+               content_type="text/markdown"):
     dist = f"{name}-{version}.dist-info"
     path = tmp / f"{name}-{version}-py3-none-any.whl"
     if corrupt:
@@ -33,7 +34,7 @@ def make_wheel(tmp, name="demo", version="1.0.0", meta_name=None, meta_version=N
         f"Summary: {summary}\n"
         f"Requires-Python: {requires_python}\n"
         f"{license_field + chr(10) if license_field else ''}"
-        f"Description-Content-Type: text/markdown\n"
+        f"Description-Content-Type: {content_type}\n"
         f"{extra_meta}\n"
         f"# demo\n\nLong description body.\n"
     )

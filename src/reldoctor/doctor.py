@@ -14,6 +14,7 @@ import email.parser
 import hashlib
 import io
 import os
+import posixpath
 import re
 import tarfile
 import zipfile
@@ -21,13 +22,16 @@ import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .reqs import parse_requirement
 from .safety import (
     JUNK_DIRS,
     JUNK_FILES,
     VCS_DIRS,
-    link_escapes,
+    StreamScanner,
+    is_normalized_path,
     path_allowed,
-    scan_secrets,
+    redact,
+    resolve_link_escapes,
     sensitive_file_kind,
     unsafe_path_reason,
 )
@@ -46,12 +50,25 @@ ENTRY_POINT = re.compile(
     r"\s*(\[\s*[\w.-]+(\s*,\s*[\w.-]+)*\s*\])?$"
 )
 CONTENT_TYPES = {"text/plain", "text/x-rst", "text/markdown"}
+MARKDOWN_VARIANTS = {"GFM", "CommonMark"}  # packaging.metadata, case-sensitive
+# warehouse forklift/metadata.py SUPPORTED_METADATA_VERSIONS
+SUPPORTED_METADATA_VERSIONS = {"1.0", "1.1", "1.2", "2.1", "2.2", "2.3", "2.4", "2.5"}
+DIST_FIELDS = ("Requires-Dist", "Provides-Dist", "Obsoletes-Dist")
+MAX_SUMMARY_LENGTH = 512        # warehouse _LENGTH_LIMITS
+MAX_VERSION_LENGTH = 128        # warehouse MAX_VERSION_LENGTH
+MAX_PROJECT_URL_LABEL = 32      # warehouse project-url label limit
+# warehouse legacy.py: zips over 64 MiB uncompressed and > 50x ratio are rejected,
+# and only stored/deflated members are accepted
+COMPRESSION_RATIO_MIN_SIZE = 64 * 1024 * 1024
+COMPRESSION_RATIO_THRESHOLD = 50
+ALLOWED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 BINARY_EXT = re.compile(r"\.(pyd|dll|dylib|so(\.\d+)*)$", re.IGNORECASE)
 
 # Bounds for untrusted archives.
 MAX_METADATA_BYTES = 16 * 1024 * 1024        # METADATA / PKG-INFO / RECORD
-MAX_SCAN_BYTES = 2 * 1024 * 1024             # per-file secret scan
 MAX_ARCHIVE_READ = 1024 * 1024 * 1024        # total bytes hashed/scanned per archive
+DEFAULT_MAX_MEMBERS = 100_000
+MAX_MEMBERS = DEFAULT_MAX_MEMBERS            # members per archive (CLI: --max-members)
 CHUNK = 1024 * 1024
 
 # code -> (severity, what it means). Severity lives here so a code is always
@@ -66,11 +83,17 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "wheel_corrupt": ("error", "wheel is not a readable zip"),
     "sdist_corrupt": ("error", "sdist is not a readable tarball"),
     "unsafe_path": ("error", "member path is absolute, uses '..', a drive letter or backslashes"),
+    "path_not_normalized": ("error", "member path is not normalized (a/./b, a//b, ./a); PyPI rejects it"),
+    "too_many_members": ("error", "archive has more members than --max-members; not inspected further"),
+    "sparse_member": ("error", "sdist has a GNU sparse member; PyPI rejects it"),
+    "unsupported_compression": ("error", "wheel member is not stored/deflated (bzip2, lzma...); PyPI rejects it"),
+    "compression_ratio": ("error", "wheel expands > 50x and past 64 MiB; PyPI rejects it as a zip bomb"),
+    "zip_symlink": ("warn", "wheel member carries symlink mode bits"),
     "duplicate_entry": ("error", "the same path appears twice in the archive"),
     "case_collision": ("warn", "paths differ only by case (collide on Windows/macOS)"),
-    "unsafe_link": ("error", "sdist symlink/hardlink points outside the archive"),
+    "unsafe_link": ("error", "sdist symlink/hardlink points outside the archive (chains followed)"),
     "special_file": ("error", "sdist contains a device, FIFO or other special file"),
-    "archive_too_large": ("warn", "archive exceeds the read budget; some content checks skipped"),
+    "archive_too_large": ("warn", "archive exceeds the read budget; hash/secret checks are partial"),
     "member_unreadable": ("error", "an archive member could not be read"),
     # leaks and junk
     "sensitive_file": ("error", "a credential file (.env, .pypirc, SSH key...) is shipped"),
@@ -93,6 +116,7 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "record_size_mismatch": ("error", "RECORD size does not match the file"),
     "record_weak_hash": ("error", "RECORD uses md5/sha1 or an unknown algorithm"),
     "record_no_hash": ("warn", "RECORD row has no hash"),
+    "record_unparseable": ("error", "RECORD is not valid CSV (NUL bytes, oversized fields...)"),
     "bad_entry_point": ("error", "entry_points.txt line does not parse"),
     # metadata (wheel METADATA and sdist PKG-INFO)
     "name_mismatch": ("error", "metadata Name disagrees with the filename"),
@@ -101,6 +125,8 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "local_version": ("error", "Version has a +local segment; PyPI rejects it"),
     "dev_version": ("warn", "Version is a .dev release"),
     "no_summary": ("warn", "no Summary"),
+    "summary_too_long": ("error", "Summary longer than 512 characters; PyPI rejects it"),
+    "version_too_long": ("error", "Version longer than 128 characters; PyPI rejects it"),
     "no_requires_python": ("warn", "no Requires-Python"),
     "no_license_metadata": ("warn", "no License, License-Expression or License classifier"),
     "license_conflict": ("error", "both License and License-Expression set; PyPI rejects this (PEP 639)"),
@@ -108,11 +134,14 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "license_file_missing": ("error", "a License-File is not in the archive (PEP 639)"),
     "no_long_description": ("warn", "no long description"),
     "no_content_type": ("warn", "long description has no Description-Content-Type"),
-    "bad_content_type": ("warn", "Description-Content-Type is not text/plain, text/x-rst or text/markdown"),
-    "direct_url_dependency": ("error", "Requires-Dist uses a direct URL; PyPI rejects it"),
-    "bad_project_url": ("warn", "Project-URL/Home-page is not 'Label, https://...'"),
+    "bad_content_type": ("error", "Description-Content-Type is not text/plain|x-rst|markdown, "
+                                  "UTF-8, GFM/CommonMark; PyPI rejects it"),
+    "direct_url_dependency": ("error", "Requires/Provides/Obsoletes-Dist uses a direct URL; PyPI rejects it"),
+    "bad_requirement": ("error", "a *-Dist value is not a valid PEP 508 requirement; PyPI rejects it"),
+    "project_url_rejected": ("error", "Project-URL has no label, a label over 32 chars, or no URL; PyPI rejects it"),
+    "bad_project_url": ("warn", "Project-URL/Home-page is not an http(s) URL"),
     "old_metadata_version": ("warn", "Metadata-Version older than 2.1"),
-    "bad_metadata_version": ("error", "unparseable Metadata-Version"),
+    "bad_metadata_version": ("error", "Metadata-Version is unparseable or not one PyPI accepts"),
     # sdist structure
     "sdist_no_root": ("error", "sdist does not have exactly one top-level directory"),
     "sdist_root_mismatch": ("warn", "sdist top-level dir is not {name}-{version}"),
@@ -131,7 +160,7 @@ CHECKS: Dict[str, Tuple[str, str]] = {
 # Codes that can never be silenced: ignoring them would let a broken or empty
 # release pass, so the gate has to stay closed.
 UNIGNORABLE = {"no_artifacts", "wheel_corrupt", "sdist_corrupt", "wheel_no_dist_info",
-               "sdist_no_pkg_info", "member_unreadable"}
+               "sdist_no_pkg_info", "member_unreadable", "record_unparseable", "too_many_members"}
 
 
 @dataclass(frozen=True)
@@ -147,7 +176,9 @@ class Finding:
 
 
 def _f(code: str, message: str, file: str = "") -> Finding:
-    return Finding(CHECKS[code][0], code, message, file)
+    # Every message is redacted here, centrally: findings quote archive
+    # content (URLs, requirement strings, paths) that may carry credentials.
+    return Finding(CHECKS[code][0], code, redact(message), redact(file))
 
 
 def normalize(name: str) -> str:
@@ -234,30 +265,73 @@ def check_metadata(meta: email.message.Message, label: str,
         out.append(_f("no_content_type",
                       "long description present but no Description-Content-Type; "
                       "PyPI may render it as plain text", label))
-    if dct and dct.split(";")[0].strip().lower() not in CONTENT_TYPES:
-        out.append(_f("bad_content_type", f"Description-Content-Type {dct!r} is not one PyPI renders", label))
+    if dct:
+        problem = content_type_problem(dct)
+        if problem:
+            out.append(_f("bad_content_type", f"Description-Content-Type {dct!r}: {problem}", label))
+    summary = meta.get("Summary") or ""
+    if len(summary) > MAX_SUMMARY_LENGTH:
+        out.append(_f("summary_too_long", f"Summary is {len(summary)} characters (max {MAX_SUMMARY_LENGTH})", label))
+    if len(version) > MAX_VERSION_LENGTH:
+        out.append(_f("version_too_long", f"Version is {len(version)} characters (max {MAX_VERSION_LENGTH})", label))
 
-    for req in meta.get_all("Requires-Dist", []):
-        spec = req.split(";", 1)[0]
-        if "@" in spec:
-            out.append(_f("direct_url_dependency",
-                          f"Requires-Dist {req.strip()!r} is a direct URL; PyPI rejects "
-                          "\"Can't have direct dependency\"", label))
+    out.extend(check_dist_fields(meta, label))
     for pu in meta.get_all("Project-URL", []):
         lab, sep, url = pu.partition(",")
-        if not sep or not lab.strip() or not _url_ok(url):
-            out.append(_f("bad_project_url", f"Project-URL {pu.strip()!r} is not 'Label, https://...'", label))
+        lab, url = lab.strip(), url.strip()
+        if not sep or not lab or not url or len(lab) > MAX_PROJECT_URL_LABEL:
+            out.append(_f("project_url_rejected",
+                          f"Project-URL {pu.strip()!r} needs 'Label, URL' with a label of at most "
+                          f"{MAX_PROJECT_URL_LABEL} characters", label))
+        elif not _url_ok(url):
+            out.append(_f("bad_project_url", f"Project-URL {pu.strip()!r} is not an http(s) URL", label))
     home = meta.get("Home-page")
     if home and home.strip().upper() != "UNKNOWN" and not _url_ok(home):
         out.append(_f("bad_project_url", f"Home-page {home.strip()!r} is not an http(s) URL", label))
-
-    md_ver = meta.get("Metadata-Version", "") or ""
-    try:
-        if tuple(int(x) for x in md_ver.split(".")[:2]) < (2, 1):
-            out.append(_f("old_metadata_version", f"Metadata-Version {md_ver} is old; use >= 2.1", label))
-    except ValueError:
-        out.append(_f("bad_metadata_version", f"unparseable Metadata-Version {md_ver!r}", label))
+    out.extend(check_metadata_version(meta, label))
     return out
+
+
+def content_type_problem(value: str) -> Optional[str]:
+    """Mirror packaging.metadata's Description-Content-Type validation."""
+    msg = email.message.Message()
+    msg["content-type"] = value
+    ctype = msg.get_content_type().lower()
+    if ctype not in CONTENT_TYPES or ctype not in value.lower():
+        return f"must be one of {sorted(CONTENT_TYPES)}"
+    charset = msg.get_param("charset", "UTF-8")
+    if not isinstance(charset, str) or charset.lower() != "utf-8":
+        return "only charset=UTF-8 is allowed"
+    variant = msg.get_param("variant", "GFM")
+    if ctype == "text/markdown" and variant not in MARKDOWN_VARIANTS:
+        return f"Markdown variant must be one of {sorted(MARKDOWN_VARIANTS)}"
+    return None
+
+
+def check_dist_fields(meta: email.message.Message, label: str) -> List[Finding]:
+    """Requires-/Provides-/Obsoletes-Dist must parse and must not be direct URLs."""
+    out: List[Finding] = []
+    for field in DIST_FIELDS:
+        for req in meta.get_all(field, []):
+            err, direct = parse_requirement(req)
+            if err:
+                out.append(_f("bad_requirement", f"{field} {req.strip()!r} is invalid: {err}", label))
+            elif direct:
+                out.append(_f("direct_url_dependency",
+                              f"{field} {req.strip()!r} is a direct URL; PyPI rejects "
+                              "\"Can't have direct dependency\"", label))
+    return out
+
+
+def check_metadata_version(meta: email.message.Message, label: str) -> List[Finding]:
+    md_ver = (meta.get("Metadata-Version", "") or "").strip()
+    if md_ver not in SUPPORTED_METADATA_VERSIONS:
+        return [_f("bad_metadata_version",
+                   f"Metadata-Version {md_ver!r} is not one PyPI accepts "
+                   f"({', '.join(sorted(SUPPORTED_METADATA_VERSIONS))})", label)]
+    if _md_version(meta) < (2, 1):
+        return [_f("old_metadata_version", f"Metadata-Version {md_ver} is old; use >= 2.1", label)]
+    return []
 
 
 # --- member-level checks shared by both archive types ---------------------
@@ -269,10 +343,13 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
     dup_reported: Set[str] = set()
     junk: Set[str] = set()
     vcs = False
+    unnormalized: List[str] = []
     for n in names:
         reason = unsafe_path_reason(n)
         if reason:
             out.append(_f("unsafe_path", f"member {n!r} {reason}", label))
+        elif not is_normalized_path(n):
+            unnormalized.append(n)
         key = n.rstrip("/")
         if key in seen and key not in dup_reported:
             dup_reported.add(key)
@@ -293,6 +370,10 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
             parts[-1] if parts[-1] in JUNK_FILES else None)
         if hit:
             junk.add(hit)
+    if unnormalized:
+        out.append(_f("path_not_normalized",
+                      f"{len(unnormalized)} member path(s) are not normalized (e.g. {unnormalized[0]!r}); "
+                      "PyPI rejects \"Archive member path is not normalized\"", label))
     if vcs:
         out.append(_f("vcs_metadata_shipped", "version-control metadata (.git/.hg/.svn) is shipped", label))
     if junk:
@@ -330,8 +411,17 @@ def _record_hash(fp, algo: str) -> Tuple[str, int]:
     return base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode("ascii"), size
 
 
-def _secret_findings(name: str, blob: bytes, label: str) -> List[Finding]:
-    kinds = scan_secrets(blob)
+def _scan_stream(fp) -> List[str]:
+    scanner = StreamScanner()
+    while True:
+        chunk = fp.read(CHUNK)
+        if not chunk:
+            break
+        scanner.feed(chunk)
+    return scanner.kinds
+
+
+def _secret_findings(name: str, kinds: List[str], label: str) -> List[Finding]:
     if not kinds:
         return []
     return [_f("secret_in_file", f"{name!r} contains what looks like a {', '.join(kinds)} "
@@ -364,8 +454,28 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
         return [_f("wheel_corrupt", f"{fname} is not a valid zip", fname)]
     with zf:
         infos = zf.infolist()
+        if len(infos) > MAX_MEMBERS:
+            return [_f("too_many_members", f"{len(infos)} members (limit {MAX_MEMBERS}; see --max-members)", fname)]
         names = [i.filename for i in infos]
         out.extend(check_member_names(names, fname, allow))
+        bad_comp = [i.filename for i in infos if i.compress_type not in ALLOWED_ZIP_COMPRESSION]
+        if bad_comp:
+            out.append(_f("unsupported_compression",
+                          f"{len(bad_comp)} member(s) use a compression PyPI rejects (e.g. {bad_comp[0]!r}); "
+                          "only stored/deflated are accepted", fname))
+        try:
+            packed = os.stat(path).st_size
+        except OSError:
+            packed = 0
+        unpacked = sum(i.file_size for i in infos)
+        if packed and unpacked > COMPRESSION_RATIO_MIN_SIZE and unpacked / packed > COMPRESSION_RATIO_THRESHOLD:
+            out.append(_f("compression_ratio",
+                          f"expands to {unpacked} bytes from {packed} (> {COMPRESSION_RATIO_THRESHOLD}x); "
+                          "PyPI rejects this as a zip bomb", fname))
+        links = [i.filename for i in infos if (i.external_attr >> 16) & 0o170000 == 0o120000]
+        if links:
+            out.append(_f("zip_symlink", f"{len(links)} member(s) have symlink mode bits (e.g. {links[0]!r}); "
+                                         "installers write them as regular files", fname))
         files = [i for i in infos if not i.is_dir()]
         member_set = {i.filename for i in files}
 
@@ -448,7 +558,15 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                 unhashed: List[str] = []
                 problems = {"record_missing_file": [], "record_hash_mismatch": [],
                             "record_size_mismatch": [], "record_weak_hash": []}
-                for row in csv.reader(io.StringIO(rtext)):
+                try:
+                    if "\x00" in rtext:
+                        raise csv.Error("line contains NUL")
+                    rows = list(csv.reader(io.StringIO(rtext)))
+                except csv.Error as e:
+                    out.append(_f("record_unparseable", f"{record_path} is not valid CSV ({e}); "
+                                                        "its hashes cannot be checked", fname))
+                    rows = None
+                for row in rows or []:
                     if not row or not row[0].strip():
                         continue
                     rpath = row[0]
@@ -493,25 +611,22 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                 if unhashed:
                     out.append(_f("record_no_hash", f"{len(unhashed)} RECORD row(s) without a hash "
                                                     f"(e.g. {unhashed[0]!r})", fname))
-                missing = sorted(n for n in member_set if n not in listed)
+                missing = sorted(n for n in member_set if n not in listed) if rows is not None else []
                 if missing:
                     out.append(_f("record_incomplete",
                                   f"{len(missing)} file(s) absent from RECORD (e.g. {missing[0]!r})", fname))
 
-        # leaked secrets (bounded scan of every small file)
+        # leaked secrets: every file, streamed in overlapping chunks, within the budget
         for info in files:
-            if path_allowed(info.filename, allow):
-                continue
-            if info.file_size > MAX_SCAN_BYTES or not budget.take(info.file_size):
+            if path_allowed(info.filename, allow) or not budget.take(info.file_size):
                 continue
             try:
                 with zf.open(info) as fp:
-                    blob = _read_capped(fp, MAX_SCAN_BYTES)
+                    kinds = _scan_stream(fp)
             except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
                 out.append(_f("member_unreadable", f"{info.filename!r}: {type(e).__name__}", fname))
                 continue
-            if blob:
-                out.extend(_secret_findings(info.filename, blob, fname))
+            out.extend(_secret_findings(info.filename, kinds, fname))
         if budget.exhausted:
             out.append(_f("archive_too_large",
                           f"more than {MAX_ARCHIVE_READ} bytes of content; hash/secret checks are partial", fname))
@@ -535,6 +650,8 @@ def wheel_metadata(path: str) -> Optional[email.message.Message]:
     """METADATA of a wheel, or None if it cannot be read safely."""
     try:
         with zipfile.ZipFile(path) as zf:
+            if len(zf.infolist()) > MAX_MEMBERS:
+                return None
             metas = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA") and n.count("/") == 1]
             if len(metas) != 1:
                 return None
@@ -560,7 +677,12 @@ def check_sdist(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
     try:
         tf = _open_tar(path)
         with tf:
-            members = tf.getmembers()
+            members = []
+            for mem in tf:
+                members.append(mem)
+                if len(members) > MAX_MEMBERS:
+                    return [_f("too_many_members", f"more than {MAX_MEMBERS} members "
+                                                   "(see --max-members)", fname)]
             return out + _check_sdist_members(tf, members, fname, allow)
     except (tarfile.TarError, OSError, EOFError, zlib.error, ValueError) as e:
         return [_f("sdist_corrupt", f"{fname} is not a valid tarball ({type(e).__name__})", fname)]
@@ -569,25 +691,39 @@ def check_sdist(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
 def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fname: str,
                          allow: Tuple[str, ...] = ()) -> List[Finding]:
     out: List[Finding] = []
-    for m in members:  # some old tools prefix every member with "./"
-        while m.name.startswith("./"):
-            m.name = m.name[2:]
-    members = [m for m in members if m.name not in ("", ".")]
-    names = [m.name for m in members]
-    out.extend(check_member_names(names, fname, allow))
-    for m in members:
-        if m.issym() or m.islnk():
-            if link_escapes(m.name, m.linkname) or (m.islnk() and unsafe_path_reason(m.linkname)):
-                out.append(_f("unsafe_link", f"{m.name!r} links to {m.linkname!r}", fname))
-        elif not (m.isfile() or m.isdir()):
-            out.append(_f("special_file", f"{m.name!r} is not a regular file or directory", fname))
+    # Raw names are what PyPI validates (path_not_normalized is reported on them);
+    # structure checks below use the normalized form, so one "./" prefix does not
+    # cascade into a dozen misleading findings.
+    out.extend(check_member_names([m.name for m in members], fname, allow))
+    by_name: Dict[str, tarfile.TarInfo] = {}
+    for mem in members:
+        norm = posixpath.normpath(mem.name) if mem.name else ""
+        if norm not in ("", "."):
+            by_name.setdefault(norm, mem)
+    links = {n: mem.linkname for n, mem in by_name.items() if mem.issym()}
+    for n, mem in by_name.items():
+        if mem.issparse():
+            out.append(_f("sparse_member", f"{n!r} is a GNU sparse member; PyPI rejects these", fname))
+        if mem.issym():
+            if resolve_link_escapes(links, n, mem.linkname):
+                out.append(_f("unsafe_link", f"{n!r} links to {mem.linkname!r}, which resolves outside "
+                                             "the archive", fname))
+        elif mem.islnk():
+            target = mem.linkname
+            if unsafe_path_reason(target) or resolve_link_escapes(links, "", target) \
+                    or posixpath.normpath(target) not in by_name:
+                out.append(_f("unsafe_link", f"hardlink {n!r} points at {target!r}, which is not a "
+                                             "member of the archive", fname))
+        elif not (mem.isfile() or mem.isdir()):
+            out.append(_f("special_file", f"{n!r} is not a regular file or directory", fname))
 
-    top = {n.split("/", 1)[0] for n in names if n not in ("", ".")}
+    names = list(by_name)
+    top = {n.split("/", 1)[0] for n in names}
     if len(top) != 1:
         out.append(_f("sdist_no_root", "sdist should contain exactly one top-level directory", fname))
     root = sorted(top)[0] if top else ""
     name_set = set(names)
-    file_set = {m.name for m in members if m.isfile()}
+    file_set = {n for n, mem in by_name.items() if mem.isfile()}
 
     m = _SDIST_NAME.match(fname)
     file_proj, file_ver = (m.group("name"), m.group("version")) if m else ("", "")
@@ -605,7 +741,7 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
     if pkg_info not in file_set:
         out.append(_f("sdist_no_pkg_info", "sdist lacks PKG-INFO", fname))
     else:
-        fp = tf.extractfile(pkg_info)
+        fp = tf.extractfile(by_name[pkg_info])
         data = _read_capped(fp, MAX_METADATA_BYTES) if fp else None
         if data is None:
             out.append(_f("member_unreadable", f"{pkg_info!r} is unreadable or too large", fname))
@@ -627,10 +763,10 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
                 lf = lf.strip()
                 if lf and (unsafe_path_reason(lf) or f"{root}/{lf}" not in file_set):
                     out.append(_f("license_file_missing", f"License-File {lf!r} is not at {root}/{lf}", fname))
-            for req in meta.get_all("Requires-Dist", []):
-                if "@" in req.split(";", 1)[0]:
-                    out.append(_f("direct_url_dependency",
-                                  f"Requires-Dist {req.strip()!r} is a direct URL; PyPI rejects it", fname))
+            # PyPI applies these to the sdist's own PKG-INFO too (warehouse
+            # validate_artifact_dependencies)
+            out.extend(check_dist_fields(meta, fname))
+            out.extend(check_metadata_version(meta, fname))
             if meta.get("License") and meta.get("License-Expression"):
                 out.append(_f("license_conflict",
                               "both License and License-Expression are set; PyPI rejects this (PEP 639)", fname))
@@ -638,15 +774,24 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
     if not any(re.search(r"(LICEN[CS]E|COPYING)", n.rsplit("/", 1)[-1].upper()) for n in file_set):
         out.append(_f("sdist_no_license_file", "no LICENSE/COPYING file in the sdist", fname))
 
-    for mem in members:
-        if not mem.isfile() or path_allowed(mem.name, allow):
+    for n, mem in by_name.items():
+        if path_allowed(n, allow):
             continue
-        if mem.size > MAX_SCAN_BYTES or not budget.take(mem.size):
+        source = mem
+        if mem.islnk():
+            # a hardlink ships its target's bytes under a new name: scan them
+            # here even when the target itself sits under --allow-path
+            source = by_name.get(posixpath.normpath(mem.linkname))
+            if source is None or not source.isfile():
+                continue
+        elif not mem.isfile():
             continue
-        fp = tf.extractfile(mem)
-        blob = _read_capped(fp, MAX_SCAN_BYTES) if fp else None
-        if blob:
-            out.extend(_secret_findings(mem.name, blob, fname))
+        if not budget.take(source.size):
+            continue
+        fp = tf.extractfile(source)
+        if fp is None:
+            continue
+        out.extend(_secret_findings(n, _scan_stream(fp), fname))
     if budget.exhausted:
         out.append(_f("archive_too_large",
                       f"more than {MAX_ARCHIVE_READ} bytes of content; secret scan is partial", fname))
@@ -656,10 +801,10 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
 def sdist_metadata(path: str) -> Optional[email.message.Message]:
     try:
         with _open_tar(path) as tf:
-            for mem in tf:
-                name = mem.name
-                while name.startswith("./"):
-                    name = name[2:]
+            for count, mem in enumerate(tf):
+                if count >= MAX_MEMBERS:
+                    return None
+                name = posixpath.normpath(mem.name)
                 if mem.isfile() and name.count("/") == 1 and name.endswith("/PKG-INFO"):
                     fp = tf.extractfile(mem)
                     data = _read_capped(fp, MAX_METADATA_BYTES) if fp else None
