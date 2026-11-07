@@ -22,6 +22,9 @@ import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from . import diff as _diff
+from . import metacheck, supply, wheelcheck
+from .binary import sniff
 from .reqs import parse_requirement
 from .safety import (
     JUNK_DIRS,
@@ -103,7 +106,7 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "bytecode_shipped": ("warn", "wheel ships .pyc/__pycache__"),
     # wheel structure
     "bad_wheel_filename": ("error", "wheel filename is not name-version[-build]-py-abi-plat.whl"),
-    "wheel_name_not_normalized": ("warn", "wheel filename project part is not normalized"),
+    "wheel_name_not_normalized": ("error", "wheel filename project part is not the normalized name; PyPI rejects it"),
     "wheel_no_dist_info": ("error", "not exactly one .dist-info/METADATA"),
     "no_wheel_file": ("error", ".dist-info/WHEEL missing"),
     "wheel_no_version": ("error", "WHEEL lacks Wheel-Version"),
@@ -157,6 +160,20 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "metadata_drift": ("warn", "wheel and sdist metadata disagree (dependencies, Requires-Python...)"),
 }
 
+for _mod in (metacheck, supply, wheelcheck, _diff):
+    for _code in _mod.CHECKS_EXTRA:
+        assert _code not in CHECKS, _code
+    CHECKS.update(_mod.CHECKS_EXTRA)
+
+# a stdlib finding on any of these already explains why packaging would reject the file
+_METADATA_CODES = {"version_not_pep440", "local_version", "license_conflict", "license_file_missing",
+                   "bad_content_type", "direct_url_dependency", "bad_requirement", "project_url_rejected",
+                   "bad_metadata_version", "invalid_classifier", "deprecated_classifier",
+                   "invalid_license_expression", "bad_requires_python", "invalid_author_email",
+                   "invalid_dynamic_field", "bad_url_field", "field_newer_than_metadata_version",
+                   "license_expression_old_metadata",
+                   "summary_too_long", "version_too_long"}
+
 # Codes that can never be silenced: ignoring them would let a broken or empty
 # release pass, so the gate has to stay closed.
 UNIGNORABLE = {"no_artifacts", "wheel_corrupt", "sdist_corrupt", "wheel_no_dist_info",
@@ -179,6 +196,10 @@ def _f(code: str, message: str, file: str = "") -> Finding:
     # Every message is redacted here, centrally: findings quote archive
     # content (URLs, requirement strings, paths) that may carry credentials.
     return Finding(CHECKS[code][0], code, redact(message), redact(file))
+
+
+def _fp(pairs, label: str) -> List[Finding]:
+    return [_f(code, msg, label) for code, msg in pairs]
 
 
 def normalize(name: str) -> str:
@@ -289,6 +310,9 @@ def check_metadata(meta: email.message.Message, label: str,
     if home and home.strip().upper() != "UNKNOWN" and not _url_ok(home):
         out.append(_f("bad_project_url", f"Home-page {home.strip()!r} is not an http(s) URL", label))
     out.extend(check_metadata_version(meta, label))
+    out.extend(_fp(metacheck.all_metadata_checks(meta, _md_version(meta)), label))
+    if desc.strip():
+        out.extend(_fp(metacheck.check_readme(meta, desc), label))
     return out
 
 
@@ -381,6 +405,10 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
     return out
 
 
+_ZIP_READ_ERRORS = (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError,
+                    ValueError, UnicodeError)
+
+
 class _Budget:
     def __init__(self, limit: Optional[int] = None):
         self.left = MAX_ARCHIVE_READ if limit is None else limit
@@ -411,21 +439,80 @@ def _record_hash(fp, algo: str) -> Tuple[str, int]:
     return base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode("ascii"), size
 
 
-def _scan_stream(fp) -> List[str]:
-    scanner = StreamScanner()
+def _scan_stream(fp, name: str = "") -> StreamScanner:
+    scanner = StreamScanner(name)
     while True:
         chunk = fp.read(CHUNK)
         if not chunk:
             break
         scanner.feed(chunk)
-    return scanner.kinds
+    return scanner
+
+
+_SOURCE_MAP = re.compile(r"\.(js|mjs|css)\.map$", re.IGNORECASE)
+_LARGE_FILE = 20 * 1024 * 1024
+MAX_PYPI_FILE = 100 * 1024 * 1024
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+class _Agg:
+    """Per-artifact roll-up of findings that are reported once, not per file."""
+
+    def __init__(self):
+        self.local: Dict[str, List[str]] = {}
+
+    def paths(self, name: str, users: List[str]) -> None:
+        for u in users:
+            self.local.setdefault(u, []).append(name)
+
+    # Documentation and source files quote example paths (`/home/guido/...`), so a
+    # name seen only there is trusted only when it recurs; any other file type
+    # (compiled code, JSON, configs, source maps) is a strong signal on its own.
+    _DOC_EXT = (".py", ".pyi", ".md", ".rst", ".txt", ".html", ".ipynb", ".cfg", ".toml", ".yml", ".yaml")
+
+    def findings(self, label: str) -> List[Finding]:
+        real: Dict[str, List[str]] = {}
+        for user, names in self.local.items():
+            strong = any(not (n.lower().endswith(self._DOC_EXT) or n.endswith(("/METADATA", "/PKG-INFO", "PKG-INFO")))
+                         for n in names)
+            if strong or len(set(names)) >= 3:
+                real[user] = names
+        if not real:
+            return []
+        files = sorted({n for v in real.values() for n in v})
+        users = ", ".join(sorted(real)[:5])
+        return [_f("local_path_leak",
+                   f"{len(files)} file(s) contain a personal home-directory path for user(s) {users} "
+                   f"(e.g. {files[0]!r}); it exposes a username and machine layout. Build in a clean "
+                   "container or strip paths", label)]
+
+
+def _file_findings(name: str, size: int, sc: StreamScanner, label: str, allowed: bool,
+                   agg: _Agg) -> List[Finding]:
+    """Findings from one scanned file. `allowed` (from --allow-path) exempts the
+    secret and personal-path checks only."""
+    out: List[Finding] = []
+    if sc.kinds and not allowed:
+        out.append(_f("secret_in_file", f"{name!r} contains what looks like a {', '.join(sc.kinds)} "
+                                        "(value not shown); it would be public on PyPI. If this is a deliberate "
+                                        "test fixture, exempt it with --allow-path", label))
+    if sc.obfuscated:
+        out.append(_f("obfuscated_exec", f"{name!r} runs exec()/eval() on decoded data (base64/zlib/marshal...)", label))
+    if sc.local_users and not allowed:
+        agg.paths(name, sc.local_users)
+    if sc.head.startswith(_SQLITE_MAGIC):
+        out.append(_f("database_file_shipped", f"{name!r} is a SQLite database", label))
+    if _SOURCE_MAP.search(name):
+        out.append(_f("source_map_shipped", f"{name!r} is a source map: it embeds original source and build paths", label))
+    if size >= _LARGE_FILE and not wheelcheck.binary_is_library(name):
+        out.append(_f("large_file", f"{name!r} is {size:,} bytes; confirm it belongs in a package", label))
+    return out
 
 
 def _secret_findings(name: str, kinds: List[str], label: str) -> List[Finding]:
-    if not kinds:
-        return []
-    return [_f("secret_in_file", f"{name!r} contains what looks like a {', '.join(kinds)} "
-                                 "(value not shown); it would be public on PyPI", label)]
+    sc = StreamScanner(name)
+    sc.kinds = list(kinds)
+    return _file_findings(name, 0, sc, label, False, _Agg())
 
 
 # --- wheel -----------------------------------------------------------------
@@ -450,7 +537,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
     fname = os.path.basename(path)
     try:
         zf = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError, ValueError, EOFError):
+    except (zipfile.BadZipFile, OSError, ValueError, EOFError, NotImplementedError, RuntimeError, zlib.error):
         return [_f("wheel_corrupt", f"{fname} is not a valid zip", fname)]
     with zf:
         infos = zf.infolist()
@@ -503,7 +590,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
             try:
                 with zf.open(member) as fp:
                     data = _read_capped(fp, MAX_METADATA_BYTES)
-            except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+            except _ZIP_READ_ERRORS as e:
                 out.append(_f("member_unreadable", f"{member!r}: {type(e).__name__}", fname))
                 return None
             if data is None:
@@ -521,8 +608,18 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
         if version != file_ver:
             out.append(_f("version_mismatch", f"METADATA Version {version!r} != filename version {file_ver!r}", fname))
         out.extend(check_metadata(meta, fname, member_set, f"{dist_dir}/licenses/"))
+        out.extend(_fp(wheelcheck.check_dist_info_name(fname, dist_dir), fname))
+        pk = wheelcheck.packaging_problems(text)
+        if pk and not any(f.severity == "error" and f.code in _METADATA_CODES for f in out):
+            out.extend(_f("packaging_rejects_metadata", m, fname) for m in pk)
+        desc_text = _long_description(meta)
+        if desc_text.strip():
+            rp = wheelcheck.render_problem(meta, desc_text)
+            if rp:
+                out.append(_f("description_render_failed", f"PyPI would show 'description failed to render': {rp}", fname))
 
         # WHEEL file and tags
+        root_purelib: Optional[bool] = None
         if f"{dist_dir}/WHEEL" not in member_set:
             out.append(_f("no_wheel_file", f"{dist_dir}/WHEEL missing", fname))
         else:
@@ -531,7 +628,17 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                 wheel_meta = parse_metadata(wtext)
                 if not wheel_meta.get("Wheel-Version"):
                     out.append(_f("wheel_no_version", "WHEEL file lacks Wheel-Version", fname))
-                wtags = {t.strip() for t in wheel_meta.get_all("Tag", []) if t.strip()}
+                wtags = set()
+                for raw_tag in wheel_meta.get_all("Tag", []):
+                    bits = raw_tag.strip().split("-")
+                    if len(bits) == 3:   # compressed form: cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64
+                        wtags |= {f"{a}-{b}-{c}" for a in bits[0].split(".") for b in bits[1].split(".")
+                                  for c in bits[2].split(".")}
+                    elif raw_tag.strip():
+                        wtags.add(raw_tag.strip())
+                purelib_raw = (wheel_meta.get("Root-Is-Purelib") or "").strip().lower()
+                if purelib_raw in ("true", "false"):
+                    root_purelib = purelib_raw == "true"
                 if file_tags and wtags and wtags != file_tags:
                     out.append(_f("wheel_tag_mismatch",
                                   f"WHEEL tags {sorted(wtags)} != filename tags {sorted(file_tags)}", fname))
@@ -591,7 +698,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                     try:
                         with zf.open(rpath) as fp:
                             actual, size = _record_hash(fp, algo)
-                    except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+                    except _ZIP_READ_ERRORS as e:
                         out.append(_f("member_unreadable", f"{rpath!r}: {type(e).__name__}", fname))
                         continue
                     hashed.add(rpath)
@@ -616,20 +723,49 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                     out.append(_f("record_incomplete",
                                   f"{len(missing)} file(s) absent from RECORD (e.g. {missing[0]!r})", fname))
 
-        # leaked secrets: every file, streamed in overlapping chunks, within the budget
+        # every file is streamed once, in overlapping chunks, within the budget:
+        # secrets, personal paths, obfuscated code, native-library headers
+        agg = _Agg()
+        natives: List[wheelcheck.NativeFile] = []
         for info in files:
-            if path_allowed(info.filename, allow) or not budget.take(info.file_size):
+            if not budget.take(info.file_size):
                 continue
             try:
                 with zf.open(info) as fp:
-                    kinds = _scan_stream(fp)
-            except (zipfile.BadZipFile, RuntimeError, OSError, zlib.error, NotImplementedError, EOFError) as e:
+                    sc = _scan_stream(fp, info.filename)
+            except _ZIP_READ_ERRORS as e:
                 out.append(_f("member_unreadable", f"{info.filename!r}: {type(e).__name__}", fname))
                 continue
-            out.extend(_secret_findings(info.filename, kinds, fname))
+            out.extend(_file_findings(info.filename, info.file_size, sc, fname,
+                                      path_allowed(info.filename, allow), agg))
+            bi = sniff(sc.head) if sc.head else None
+            if bi is not None and wheelcheck.binary_is_library(info.filename):
+                natives.append(wheelcheck.NativeFile(info.filename, bi, sc.glibc_max, sc.musl, sc.glibc_needed))
+            if info.filename.endswith(".pth") and info.file_size <= 65536:
+                out.extend(_fp(supply.analyze_pth(info.filename, sc.head.decode("utf-8", "replace")), fname))
+        out.extend(agg.findings(fname))
         if budget.exhausted:
             out.append(_f("archive_too_large",
                           f"more than {MAX_ARCHIVE_READ} bytes of content; hash/secret checks are partial", fname))
+
+        # tags versus contents, top-level names
+        plats = {t.split("-")[2] for t in file_tags}
+        out.extend(_fp(wheelcheck.check_platform_tags(plats), fname))
+        ext_names = [n for n in member_set if wheelcheck.binary_is_library(n) and re.search(r"\.(so|pyd)$", n)]
+        out.extend(_fp(wheelcheck.check_wheel_tags_vs_contents(
+            plats, {t.split("-")[0] for t in file_tags}, {t.split("-")[1] for t in file_tags},
+            natives, ext_names, root_purelib, meta.get("Requires-Python") or ""), fname))
+        tops = supply.top_level_names(n for n in member_set)
+        shadow = supply.shadowed_stdlib(tops)
+        if shadow:
+            out.append(_f("shadows_stdlib",
+                          f"top-level {', '.join(repr(x) for x in shadow)} has the name of a standard-library "
+                          "module and would shadow it for every program in the environment", fname))
+        clutter = supply.top_level_clutter(tops)
+        if clutter:
+            out.append(_f("top_level_tests",
+                          f"installs top-level package(s) {', '.join(repr(x) for x in clutter)} into site-packages; "
+                          "they collide with other projects' (move under your package or exclude them)", fname))
 
         # entry points
         ep_path = f"{dist_dir}/entry_points.txt"
@@ -643,6 +779,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                     continue
                 if not ENTRY_POINT.match(line):
                     out.append(_f("bad_entry_point", f"unparseable entry point: {line!r}", fname))
+            out.extend(_fp(supply.entry_point_shadows(ep_text), fname))
     return out
 
 
@@ -737,6 +874,7 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
         out.append(_f("sdist_no_build_config", "sdist contains neither pyproject.toml nor setup.py", fname))
 
     budget = _Budget()
+    agg = _Agg()
     pkg_info = f"{root}/PKG-INFO"
     if pkg_info not in file_set:
         out.append(_f("sdist_no_pkg_info", "sdist lacks PKG-INFO", fname))
@@ -791,10 +929,16 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
         fp = tf.extractfile(source)
         if fp is None:
             continue
-        out.extend(_secret_findings(n, _scan_stream(fp), fname))
+        out.extend(_file_findings(n, source.size, _scan_stream(fp, n), fname, False, agg))
+    out.extend(agg.findings(fname))
     if budget.exhausted:
         out.append(_f("archive_too_large",
                       f"more than {MAX_ARCHIVE_READ} bytes of content; secret scan is partial", fname))
+    setup = by_name.get(f"{root}/setup.py")
+    if setup is not None and setup.isfile() and not path_allowed(f"{root}/setup.py", allow):
+        fp = tf.extractfile(setup)
+        data = fp.read(supply.MAX_SETUP_BYTES + 1) if fp else b""
+        out.extend(_fp(supply.analyze_setup_py(data), fname))
     return out
 
 
@@ -873,11 +1017,12 @@ def _iter_artifacts(paths: Iterable[str]) -> Tuple[List[str], List[str], List[st
     return wheels, sdists, zips, dirs
 
 
-def diagnose(paths: Iterable[str], allow: Iterable[str] = ()) -> List[Finding]:
+def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[str] = ()) -> List[Finding]:
     """Diagnose artifacts given as files and/or directories of artifacts.
 
     `allow` is a list of member-path globs (e.g. "tests/certs/*") exempt
-    from the credential-file and secret checks only.
+    from the credential-file and secret checks only. `against` is the previous
+    release (directories and/or files) for the offline release-diff checks.
     """
     paths = list(paths)
     allow = tuple(allow)
@@ -923,7 +1068,48 @@ def diagnose(paths: Iterable[str], allow: Iterable[str] = ()) -> List[Finding]:
     if len(versions) > 1:
         out.append(_f("version_drift", f"artifacts disagree on version: {sorted(versions)}"))
     out.extend(check_drift(wheel_metas, sdist_metas))
+
+    if not wheels:  # sdist-only upload: PyPI validates its PKG-INFO fields, so do the table checks here
+        for sname, smeta in sdist_metas:
+            if _md_version(smeta) >= (2, 2):
+                out.extend(_fp(metacheck.all_metadata_checks(smeta, _md_version(smeta)), sname))
+    for w in wheels + sdists:
+        try:
+            if os.path.getsize(w) > MAX_PYPI_FILE:
+                out.append(_f("file_too_large", f"{os.path.getsize(w):,} bytes; PyPI's default per-file limit is "
+                                                f"{MAX_PYPI_FILE:,} (a project can ask for more)", os.path.basename(w)))
+        except OSError:
+            pass
+    seen_names: Set[str] = set()
+    for _label, m in wheel_metas + sdist_metas:
+        nm = m.get("Name")
+        if nm and nm not in seen_names:
+            seen_names.add(nm)
+            target = supply.typosquat_target(nm)
+            if target:
+                out.append(_f("typosquat_name", f"project name {nm!r} is one edit from the very popular {target!r}; "
+                                                "PyPI may block it as a typosquat and users may confuse them"))
+    against = list(against)
+    if against:
+        out.extend(_release_diff(wheels + sdists, against))
     return out
+
+
+def _release_diff(current: List[str], against: List[str]) -> List[Finding]:
+    try:
+        old_w, old_s, _, _ = _iter_artifacts(against)
+    except (FileNotFoundError, ValueError, NotADirectoryError):
+        return [_f("diff_unreadable", f"--against path not found or not a release directory: {against}")]
+    # the new set must not include the old files themselves
+    cur_real = {os.path.realpath(p) for p in current}
+    olds = [p for p in old_w + old_s if os.path.realpath(p) not in cur_real]
+    if not olds:
+        return [_f("diff_unreadable", "no wheel or sdist found in --against; nothing to compare with")]
+    new_inv = [i for i in (_diff.read_inventory(p) for p in current) if i]
+    old_inv = [i for i in (_diff.read_inventory(p) for p in olds) if i]
+    if not old_inv:
+        return [_f("diff_unreadable", "the artifacts in --against could not be read")]
+    return [_f(code, msg) for code, msg in _diff.compare(new_inv, old_inv)]
 
 
 def diagnose_dist_dir(dist_dir: str) -> List[Finding]:

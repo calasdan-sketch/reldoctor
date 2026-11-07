@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reldoctor"
-version = "0.2.0"
-description = "Pre-upload doctor for Python releases: catches what PyPI will reject, leaked secrets, tampered RECORDs and wheel/sdist drift. Pure stdlib."
+version = "0.3.0"
+description = "Pre-upload doctor for Python releases: what PyPI will reject, what you are about to leak, wheels that lie about their contents, and what changed since the last release. Pure stdlib."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -21,8 +21,22 @@ classifiers = [
 Source = "https://github.com/calasdan-sketch/reldoctor"
 Changelog = "https://github.com/calasdan-sketch/reldoctor/blob/main/CHANGELOG.md"
 
+[project.optional-dependencies]
+# Second opinions: when installed, reldoctor also asks the libraries PyPI itself uses.
+oracle = ["packaging>=24.0"]
+render = ["readme_renderer>=43.0"]
+all = ["packaging>=24.0", "readme_renderer>=43.0"]
+
 [project.scripts]
 reldoctor = "reldoctor.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+reldoctor = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Duplicate name:UserWarning"]

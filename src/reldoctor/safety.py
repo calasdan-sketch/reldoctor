@@ -109,8 +109,40 @@ _TOKEN_SOURCES: List[Tuple[str, str]] = [
     ("PyPI API token", r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
     # real Slack tokens carry numeric team/user ids: xoxb-<digits>-<digits>-<secret>
     ("Slack token", r"\bxox[abposr]-[0-9]{6,}-[0-9A-Za-z-]{8,}"),
+    ("Slack webhook", r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}"),
+    ("Google API key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    ("Stripe live key", r"\b[sr]k_live_[0-9A-Za-z]{24,}"),
+    ("OpenAI API key", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}"),
+    ("Anthropic API key", r"\bsk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{60,}"),
+    ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b"),
+    ("SendGrid API key", r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
+    ("GitLab token", r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    ("Hugging Face token", r"\bhf_[A-Za-z0-9]{34,}\b"),
+    ("npm auth token in .npmrc", r"_authToken\s*=\s*[A-Za-z0-9_\-./+=]{16,}"),
+    ("database URL with password",
+     r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^\s:/@'\"<>]+:[^\s/@'\"<>]{4,}@[^\s'\"<>/]+"),
 ]
-SECRET_PATTERNS = [(kind, re.compile(src.encode())) for kind, src in _TOKEN_SOURCES]
+# Literal substrings every match must contain: a plain `in` test (memchr speed)
+# gates each regex, so clean megabyte-sized binaries are not run through
+# fifteen regular expressions.
+_NEEDLES = {
+    "AWS access key id": (b"AKIA", b"ASIA"),
+    "GitHub token": (b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"),
+    "PyPI API token": (b"pypi-AgEI",),
+    "Slack token": (b"xox",),
+    "Slack webhook": (b"hooks.slack.com",),
+    "Google API key": (b"AIza",),
+    "Stripe live key": (b"k_live_",),
+    "OpenAI API key": (b"sk-proj-", b"sk-svcacct-", b"sk-admin-"),
+    "Anthropic API key": (b"sk-ant-",),
+    "npm token": (b"npm_",),
+    "SendGrid API key": (b"SG.",),
+    "GitLab token": (b"glpat-",),
+    "Hugging Face token": (b"hf_",),
+    "npm auth token in .npmrc": (b"_authToken",),
+    "database URL with password": (b"://",),
+}
+SECRET_PATTERNS = [(kind, re.compile(src.encode()), _NEEDLES[kind]) for kind, src in _TOKEN_SOURCES]
 _TEXT_PATTERNS = [(kind, re.compile(src)) for kind, src in _TOKEN_SOURCES]
 _TEXT_PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----")
 
@@ -120,16 +152,32 @@ _TEXT_PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----")
 _PLACEHOLDER_WORDS = re.compile(rb"EXAMPLE|example|XXXX|xxxx|your|YOUR|placeholder|PLACEHOLDER|dummy|DUMMY")
 
 
+_DB_PLACEHOLDER = re.compile(
+    rb"(?i)://[^:]+:(?:password|passwd|pass|pwd|secret|changeme|your[-_a-z]*|xxx+|\*+|\$\{?\w+\}?|%s|<[^>]*>|\{[^}]*\}"
+    rb"|example|test|admin|root|postgres|guest|user)@|"
+    rb"@(?:localhost|127\.0\.0\.1|0\.0\.0\.0|host|hostname|example\.\w+|db|database|redis|postgres)(?=[:/?\s'\"]|$)")
+
+
 def _is_placeholder(token: bytes) -> bool:
+    if b"://" in token and _DB_PLACEHOLDER.search(token):
+        return True
+    if token.startswith(b"_authToken") or token.startswith(b"_authtoken"):
+        return bool(re.search(rb"\$\{|\$[A-Z_]+|<|xxxx|XXXX|your", token))
     body = token.split(b"_", 1)[-1] if token.startswith((b"gh", b"github_pat")) else token
     if _PLACEHOLDER_WORDS.search(token):
         return True
     return len(set(body)) < 6
 
 
+_PEM_ESCAPED = re.compile(
+    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:\\r)?\\n[A-Za-z0-9+/=\\rn]{60,}")
+
+
 def _has_private_key(blob: bytes) -> bool:
     """A whole PEM block, not just the header: code that *parses* keys
     mentions the header string without containing a key."""
+    if _PEM_ESCAPED.search(blob):  # a key serialized inside JSON/YAML with literal \\n
+        return True
     for i, m in enumerate(_PEM_BEGIN.finditer(blob)):
         if i >= _PEM_MAX_HEADERS:
             break
@@ -142,8 +190,10 @@ def _has_private_key(blob: bytes) -> bool:
 
 def scan_secrets(blob: bytes) -> List[str]:
     """Kinds of secrets found in blob (deduplicated, in pattern order)."""
-    kinds = ["private key"] if _has_private_key(blob) else []
-    for kind, rx in SECRET_PATTERNS:
+    kinds = ["private key"] if (b"PRIVATE KEY" in blob and _has_private_key(blob)) else []
+    for kind, rx, needles in SECRET_PATTERNS:
+        if not any(n in blob for n in needles):
+            continue
         if any(not _is_placeholder(m.group()) for m in rx.finditer(blob)):
             kinds.append(kind)
     return kinds
@@ -152,18 +202,86 @@ def scan_secrets(blob: bytes) -> List[str]:
 SCAN_OVERLAP = 32 * 1024  # > PEM window + header, > any token length
 
 
-class StreamScanner:
-    """Scan a file in chunks with overlap, so large files are covered too."""
+# Usernames that appear in docs, CI images and templates rather than on a developer's laptop.
+GENERIC_USERS = {
+    "user", "username", "your-username", "yourname", "you", "me", "name", "foo", "bar", "test",
+    "tester", "someone", "somebody", "john", "jane", "jdoe", "johndoe", "janedoe", "alice", "bob",
+    "example", "runner", "runneradmin", "vsts", "builder", "build", "buildbot", "jenkins", "ubuntu",
+    "travis", "circleci", "ec2-user", "admin", "root", "docker", "vagrant", "appveyor", "azureuser",
+    "buildkite-agent", "gitlab-runner", "pi", "dev", "developer", "default", "all users", "public",
+    "pkg", "nobody", "www-data", "app", "code", "work", "home", "myuser", "my-user", "xxx", "x",
+    "shared", "tmp", "local", "bin", "lib", "opt", "usr", "var", "etc", "conda", "mambauser",
+    "sandbox", "codespace", "gitpod", "vscode", "node", "wheel", "cibuildwheel", "build-user",
+}
+_LOCAL_PATH = re.compile(
+    rb"(?<![A-Za-z0-9_.-])(?:/home/([A-Za-z0-9_-][A-Za-z0-9._-]{1,31})/|/Users/([A-Za-z0-9._ -]{2,32})/|"
+    rb"[A-Za-z]:\\{1,2}Users\\{1,2}([A-Za-z0-9._ -]{2,32})\\{1,2})")
+_OBFUSCATED_EXEC = re.compile(
+    rb"\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?"
+    rb"(?:base64\.(?:b64|urlsafe_b64|b32|a85)decode|zlib\.decompress|bz2\.decompress|lzma\.decompress|"
+    rb"codecs\.decode|marshal\.loads|bytes\.fromhex|binascii\.unhexlify|__import__\s*\(\s*['\"](?:base64|zlib|marshal)['\"])")
+ELF_MAGIC = b"\x7fELF"
 
-    def __init__(self):
+
+def _mask_user(name: str) -> str:
+    return name[:1] + "***"
+
+
+class StreamScanner:
+    """Scan a file in chunks with overlap, so large files are covered too.
+
+    Besides secrets it notes (all bounded, nothing executed): personal
+    paths such as /home/<user>/, obfuscated exec() payloads in Python files,
+    and for ELF files the newest glibc symbol version they reference.
+    """
+
+    MAX_PATHS = 50
+
+    def __init__(self, name: str = ""):
+        self.name = name
         self.kinds: List[str] = []
+        self.local_users: List[str] = []   # masked, deduplicated
+        self.obfuscated = False
+        self.head = b""
+        self.glibc_max: Optional[Tuple[int, int]] = None
+        self.musl = False
+        self.glibc_needed = False
+        self._elf = False
         self._tail = b""
+        self._first = True
+        self._is_py = name.endswith((".py", ".pyw"))
 
     def feed(self, chunk: bytes) -> None:
+        if self._first:
+            self._first = False
+            self.head = chunk[:65536]
+            self._elf = chunk.startswith(ELF_MAGIC)
         blob = self._tail + chunk
         for k in scan_secrets(blob):
             if k not in self.kinds:
                 self.kinds.append(k)
+        if len(self.local_users) < self.MAX_PATHS and (b"/home/" in blob or b"/Users/" in blob or b"Users\\" in blob):
+            for m in _LOCAL_PATH.finditer(blob):
+                user = next(g for g in m.groups() if g).decode("utf-8", "replace")
+                if user.lower() in GENERIC_USERS or user.startswith(("<", "{", "$", "%")):
+                    continue
+                masked = _mask_user(user)
+                if masked not in self.local_users:
+                    self.local_users.append(masked)
+        if self._is_py and not self.obfuscated and (b"exec" in blob or b"eval" in blob) \
+                and _OBFUSCATED_EXEC.search(blob):
+            self.obfuscated = True
+        if self._elf:
+            from .binary import GLIBC_NEEDED, GLIBC_REF, MUSL_HINT
+            if b"GLIBC_" in blob:
+                for m in GLIBC_REF.finditer(blob):
+                    v = (int(m.group(1)), int(m.group(2)))
+                    if self.glibc_max is None or v > self.glibc_max:
+                        self.glibc_max = v
+            if not self.musl and (b"musl" in blob):
+                self.musl = bool(MUSL_HINT.search(blob))
+            if not self.glibc_needed and b"libc.so.6" in blob:
+                self.glibc_needed = bool(GLIBC_NEEDED.search(blob))
         self._tail = blob[-SCAN_OVERLAP:]
 
 
@@ -185,10 +303,20 @@ SENSITIVE_BASENAMES = {
     ".netrc": "netrc credentials",
     "_netrc": "netrc credentials",
     ".git-credentials": "git credentials",
+    ".pgpass": "PostgreSQL password file",
+    ".htpasswd": "htpasswd credentials",
+    ".dockercfg": "Docker registry credentials",
+    "terraform.tfstate": "Terraform state (holds secrets)",
+    "terraform.tfstate.backup": "Terraform state (holds secrets)",
+    "credentials.tfrc.json": "Terraform Cloud token",
     "id_rsa": "SSH private key",
     "id_dsa": "SSH private key",
     "id_ecdsa": "SSH private key",
     "id_ed25519": "SSH private key",
+}
+SENSITIVE_SUFFIXES = {
+    ".p12": "PKCS#12 key bundle", ".pfx": "PKCS#12 key bundle", ".jks": "Java keystore",
+    ".keystore": "Java keystore", ".kdbx": "KeePass database", ".tfvars": "Terraform variables file",
 }
 _ENV_TEMPLATES = {"example", "sample", "template", "dist", "defaults", "tmpl", "in"}
 
@@ -206,6 +334,10 @@ def sensitive_file_kind(name: str) -> Optional[str]:
     base = parts[-1]
     if base in SENSITIVE_BASENAMES:
         return SENSITIVE_BASENAMES[base]
+    low = base.lower()
+    for suf, why in SENSITIVE_SUFFIXES.items():
+        if low.endswith(suf):
+            return why
     if base == ".env" or (base.startswith(".env.") and base[5:].lower() not in _ENV_TEMPLATES):
         return "dotenv file"
     if len(parts) >= 2 and parts[-2] == ".aws" and base in {"credentials", "config"}:

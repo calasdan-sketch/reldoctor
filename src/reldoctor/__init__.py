@@ -2,5 +2,5 @@
 
 from .doctor import CHECKS, Finding, diagnose, diagnose_dist_dir
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["diagnose", "diagnose_dist_dir", "Finding", "CHECKS", "__version__"]

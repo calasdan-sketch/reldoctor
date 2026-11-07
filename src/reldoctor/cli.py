@@ -10,6 +10,7 @@ from typing import List
 from . import __version__
 from . import doctor
 from .doctor import CHECKS, UNIGNORABLE, Finding, diagnose
+from . import formats
 from .safety import check_allow_patterns, escape_terminal
 
 
@@ -57,8 +58,12 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("paths", nargs="*", metavar="PATH",
                     help="dist directory and/or .whl / .tar.gz files (e.g. dist/)")
     ap.add_argument("--strict", action="store_true", help="warnings also fail")
-    ap.add_argument("--format", choices=["text", "json", "github"], default="text",
-                    help="output format; 'github' emits Actions annotations")
+    ap.add_argument("--format", choices=["text", "json", "github", "sarif", "junit"], default="text",
+                    help="output format; 'github' emits Actions annotations, 'sarif' SARIF 2.1.0 for code "
+                         "scanning, 'junit' JUnit XML")
+    ap.add_argument("--against", action="append", default=[], metavar="PATH",
+                    help="previous release (directory or files, e.g. from `pip download PROJECT==OLD --no-deps`): "
+                         "report size jumps, new dependencies, new commands, dropped wheels. Offline.")
     ap.add_argument("--json", action="store_true", help="same as --format json")
     ap.add_argument("--ignore", action="append", default=[], metavar="CODE[,CODE]",
                     help="silence a finding code (repeatable); see --list-checks")
@@ -104,7 +109,7 @@ def main(argv: List[str] | None = None) -> int:
     try:
         saved, doctor.MAX_MEMBERS = doctor.MAX_MEMBERS, args.max_members
         try:
-            findings = diagnose(args.paths, allow=args.allow_path)
+            findings = diagnose(args.paths, allow=args.allow_path, against=args.against)
         finally:
             doctor.MAX_MEMBERS = saved
     except FileNotFoundError as e:
@@ -125,6 +130,10 @@ def main(argv: List[str] | None = None) -> int:
                            "findings": [f.as_dict() for f in findings]}, indent=2)
     elif fmt == "github":
         text = _render_github(findings, errors, warns, failed)
+    elif fmt == "sarif":
+        text = formats.to_sarif(findings, CHECKS, __version__)
+    elif fmt == "junit":
+        text = formats.to_junit(findings, args.strict)
     else:
         text = _render_text(findings, errors, warns, failed)
     try:

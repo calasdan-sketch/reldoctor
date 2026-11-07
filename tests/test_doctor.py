@@ -9,7 +9,6 @@ import zipfile
 import pytest
 
 from reldoctor.doctor import (
-    Finding,
     check_sdist,
     check_wheel,
     diagnose_dist_dir,
@@ -159,7 +158,7 @@ def test_license_found_in_license_expression_or_classifier(tmp_path):
 
     # classifier-only metadata (the dict-vs-Message crash CI caught)
     make_wheel(tmp_path, name="cls", version="1.0.0",
-               extra_meta="Classifier: OSI Approved :: MIT License\n", license_field="")
+               extra_meta="Classifier: License :: OSI Approved :: MIT License\n", license_field="")
     assert "no_license_metadata" not in codes(
         check_wheel(str(tmp_path / "cls-1.0.0-py3-none-any.whl")))
 
@@ -173,7 +172,7 @@ def test_license_warns_when_truly_absent(tmp_path):
 def test_real_world_metadata_parses_repeated_headers(tmp_path):
     # repeated Classifier headers must all survive parsing (Message, not dict)
     p = make_wheel(tmp_path, name="rep", version="1.0.0", license_field="",
-                   extra_meta="Classifier: OSI Approved :: MIT License\n"
+                   extra_meta="Classifier: License :: OSI Approved :: MIT License\n"
                               "Classifier: Topic :: Utilities\n")
     from reldoctor.doctor import check_wheel, parse_metadata
     import zipfile as zf
