@@ -11,24 +11,27 @@ changed since the last release. Pure standard library, no network, nothing extra
 ## Quick start
 
 ```bash
-pip install reldoctor
-python -m build          # or: uv build / hatch build / flit build
-reldoctor dist/          # audit everything in dist/
+pip install "reldoctor>=0.3"     # Python 3.9 or newer; older releases lack --against, --explain and most checks
+python -m build                  # or: uv build / hatch build / flit build
+reldoctor dist/                  # audit everything in dist/
+reldoctor --version              # confirm you got 0.3 or newer
 
 pip download myproject==1.2.3 --no-deps -d prev/   # the last release, for comparison
 reldoctor dist/ --against prev/
 ```
 
-A synthetic broken release (built by `bench/build.py`, not a real project):
+A synthetic broken release (built by `python -m bench.demo OUT`, not a real project; the wheel name is
+shortened to `[...]` here and the two INFO lines are omitted):
 
 ```
 $ reldoctor dist/ --against prev/
-ERROR invalid_classifier   [acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] classifier 'Topic :: Software Development :: Widgets' is not a valid trove classifier (checked against trove-classifiers 2026.9.21.13); PyPI rejects the upload
+ERROR invalid_classifier    [...] classifier 'Topic :: Software Development :: Widgets' is not a valid trove classifier (checked against trove-classifiers 2026.9.21.13); PyPI rejects the upload. Fix the spelling or remove it
 WARN  readme_relative_links [...] long description links to 1 relative path(s) ('docs/logo.png'); PyPI does not resolve them, so they render broken. Use absolute https:// URLs
-ERROR secret_in_file       [...] 'acme_widgets/settings.py' contains what looks like a Stripe live key (value not shown); it would be public on PyPI. If this is a deliberate test fixture, exempt it with --allow-path
-WARN  local_path_leak      [...] 1 file(s) contain a personal home-directory path for user(s) j*** (e.g. 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so'); it exposes a username and machine layout
-ERROR binary_arch_mismatch [...] '..._speed.cpython-312-x86_64-linux-gnu.so' is built for arm64 but the wheel tag 'manylinux2014_x86_64' promises x86_64; it will fail to import there
-ERROR manylinux_glibc_too_new [...] '..._speed.cpython-312-x86_64-linux-gnu.so' references GLIBC_2.34 but the tag promises glibc 2.17; `auditwheel repair` would relabel it manylinux_2_34
+ERROR secret_in_file        [...] 'acme_widgets/settings.py' contains what looks like a Stripe live key (value not shown); it would be public on PyPI. If this is a deliberate test fixture, exempt it with --allow-path
+WARN  local_path_leak       [...] 1 file(s) contain a personal home-directory path for user(s) j*** (e.g. 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so'); it exposes a username and machine layout. Build in a clean container or strip paths
+ERROR binary_arch_mismatch  [...] 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' is built for arm64 but the wheel tag 'manylinux2014_x86_64' promises x86_64; it will fail to import there
+ERROR manylinux_glibc_too_new [...] 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' references GLIBC_2.34 but the tag promises glibc 2.17; `auditwheel repair` would relabel it manylinux_2_34
+checked 2 file(s): acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl, acme_widgets-1.0.0.tar.gz
 
 4 error(s), 2 warning(s) - FAIL
 ```
@@ -54,9 +57,9 @@ ERROR manylinux_glibc_too_new [...] '..._speed.cpython-312-x86_64-linux-gnu.so' 
 
 ```bash
 reldoctor dist/                              # a directory of artifacts
-reldoctor dist/*.whl dist/*.tar.gz           # or specific files
+reldoctor dist/*.whl dist/*.tar.gz           # or specific files (reldoctor expands the * itself on Windows)
 reldoctor dist/ --strict                     # warnings fail too (release mode)
-reldoctor dist/ --format json                # machine-readable (--json still works)
+reldoctor dist/ --format json                # machine-readable (--json still works); json, github, sarif, junit and markdown are always UTF-8
 reldoctor dist/ --format github              # GitHub Actions annotations
 reldoctor dist/ --format sarif > reldoctor.sarif   # GitHub code scanning / any SARIF viewer
 reldoctor dist/ --format junit > reldoctor.xml     # JUnit XML for CI dashboards
@@ -129,7 +132,7 @@ numbers as "what that tool does not look at"; the last two rows use real PyPI wh
 | False positives on 25 good synthetic releases | 0 | 0 | 0 | 0 | n/a |
 | Real PyPI wheels re-labelled with a wrong platform tag, detected (12; credited only if the tool passes the genuine wheel) | **12** | 0 | 0 | 0 | 5 (Linux wheels only; cannot read the macOS and Windows ones) |
 | Unexplained false positives on 19 untouched real wheels | 0 (3 flagged for genuine rule hits) | not measured | not measured | not measured | not measured |
-| Median seconds per real wheel (incl. interpreter start; shared, heavily loaded machine, so compare ratios) | 1.18 (1.17 at the start of round 3) | 0.91 | 0.71 | 3.24 | not measured |
+| Median seconds per real wheel (incl. interpreter start; shared, heavily loaded machine, so compare ratios) | 0.95 (1.08 for the previous code, same run) | 0.63 | 0.43 | 1.75 | not measured |
 
 What the other tools are for, from their own documentation: `twine check` renders the long description the way
 PyPI does and validates metadata with `packaging`; check-wheel-contents lints wheel layout (W001-W202);
@@ -160,6 +163,11 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
 
 ## Honest limits
 
+- **Windows has not been run.** The code was reviewed by reading it (no `shell=True`, no signals, no file
+  replacement; archive member names are handled as `/` paths; output is escaped for a cp1252 console and the
+  machine formats are written as UTF-8; wildcards are expanded by reldoctor itself), and the CI workflow has a
+  `windows-latest` job, but nobody has watched it pass there yet. Tested for real: Python 3.11, 3.12 and 3.13 on Linux.
+  Python 3.9 and 3.10 are checked by syntax only until the CI matrix has run.
 - It inspects artifacts, not your source tree, and never contacts PyPI. Anything that depends on
   PyPI's live state is out of reach: whether the name is taken, project size quotas, per-project
   file-size overrides, its malware scan, trusted-publishing and attestation setup (PEP 740).
@@ -193,10 +201,17 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
   `archive_too_large` warning says hash/secret coverage is partial.
 - Version checking accepts canonical PEP 440 only, so non-normalized spellings like `1.0-rc1` are flagged.
 - Zip-format sdists are only flagged, not inspected.
-- reldoctor is about 1.3x slower than `twine check` and 1.7x slower than `check-wheel-contents` on real wheels (same
-  benchmark run, shared machine): it reads every byte of every file once and loads three data tables. Round 3 added
-  checks without measurably slowing real wheels (1.18 s against 1.17 s median). The parallel scan for big releases
+- reldoctor is about 1.5x slower than `twine check` and 2.2x slower than `check-wheel-contents` on real wheels (same
+  benchmark run, shared machine): it reads every byte of every file once and loads three data tables. Round 4 made it a little
+  faster than before (0.95 s against 1.08 s for the previous code on the same wheels in the same run): a single pass decides
+  whether any secret pattern can match, and the report formats are only imported when asked for. The parallel scan for big releases
   (`--jobs`) is tested for identical output but its speed-up was not measured: the 2-CPU machine used here was shared.
+- A release of tens of thousands of tiny files is slow: 40,000 members took about 40 s on the loaded machine (about 1 ms per
+  member, profiled; the archive is opened three times and every member goes through the hash and secret checks).
+- Timings are medians from one shared, busy machine (load average 9-16 on 2 CPUs); only the ratios mean anything.
+- The "previous code" row of the benchmark shows 24 false positives out of 25 good releases on the machine used here, and the cause is
+  not a rule: that machine has `readme_renderer` installed *without* its `[md]` extra, which made the old code call every
+  Markdown description unrenderable. Round 4 fixed that (see the changelog); the number is kept because it is what a user with that setup saw.
 
 ## Reproduce the benchmark
 

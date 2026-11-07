@@ -297,7 +297,7 @@ leak("leak_google_api_key", "acme_widgets/cfg.py", ("G = '" + frag("AIza", "SyA-
 leak("leak_npm_token", "acme_widgets/cfg.py", ("N = '" + frag("npm", "_") + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'\n").encode(), {"secret_in_file"})
 leak("leak_sendgrid", "acme_widgets/cfg.py", ("SG = '" + frag("SG", ".") + "aB3dE5fG7hJ9kL1mN3pQ5r" + "." + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9f" + "'\n").encode(), {"secret_in_file"})
 leak("leak_slack_webhook", "acme_widgets/cfg.py", ("W = '" + frag("https://hooks.", "slack.com/services/") + "T0123ABCDEF/B0123ABCDEF/aB3dE5fG7hJ9kL1mN3pQ5rS7'\n").encode(), {"secret_in_file"})
-leak("leak_database_url", "acme_widgets/cfg.py", b"DB = 'postgresql://svc_app:Tr0ub4dor3xQz@db.prod.internal:5432/app'\n", {"secret_in_file"})
+leak("leak_database_url", "acme_widgets/cfg.py", frag("DB = 'postgresql", "://svc_app:", "Tr0ub4dor3xQz", "@db.prod.internal:5432/app'\n").encode(), {"secret_in_file"})
 leak("leak_npmrc_token", "acme_widgets/.npmrc", ("//registry.npmjs.org/:_authToken=" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9v\n").encode(), {"secret_in_file"})
 leak("leak_service_account_json", "acme_widgets/sa.json",
      ('{"type":"service_account","private_key":"-----BEGIN ' + 'PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC' + 'x' * 60 + '\\n-----END PRIVATE KEY-----\\n"}').encode(), {"secret_in_file"})

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -11,7 +12,6 @@ from . import __version__
 from . import config as _config
 from . import doctor
 from .doctor import CHECKS, UNIGNORABLE, Finding, diagnose
-from . import formats
 from .safety import check_allow_patterns, escape_terminal
 
 
@@ -23,12 +23,17 @@ def _gh_escape(value: str, prop: bool = False) -> str:
     return value
 
 
-def _render_text(findings: List[Finding], errors: int, warns: int, failed: bool) -> str:
+def _render_text(findings: List[Finding], errors: int, warns: int, failed: bool,
+                 checked: List[str] | None = None) -> str:
     lines = []
     for f in findings:
         where = f"[{escape_terminal(f.file)}] " if f.file else ""
         lines.append(f"{f.severity.upper():5} {f.code:26} {where}{escape_terminal(f.message)}")
     verdict = "FAIL" if failed else "PASS"
+    if checked:
+        # without this a clean run says nothing about WHICH files were looked at
+        shown = ", ".join(escape_terminal(c) for c in checked[:6]) + (f", +{len(checked) - 6} more" if len(checked) > 6 else "")
+        lines.append(f"checked {len(checked)} file(s): {shown}")
     lines.append(f"\n{errors} error(s), {warns} warning(s) - {verdict}")
     return "\n".join(lines)
 
@@ -44,6 +49,21 @@ def _render_github(findings: List[Finding], errors: int, warns: int, failed: boo
         lines.append(f"::{level[f.severity]} {props}::{_gh_escape(where + f.message)}")
     lines.append(f"reldoctor: {errors} error(s), {warns} warning(s) - {'FAIL' if failed else 'PASS'}")
     return "\n".join(lines)
+
+
+def expand_globs(paths: List[str]) -> List[str]:
+    """Expand ``dist/*.whl`` ourselves when the shell did not (Windows cmd.exe and PowerShell
+    pass wildcards through untouched). A name that exists is never treated as a pattern, and a
+    pattern that matches nothing is left alone so it is reported as "no such file"."""
+    out: List[str] = []
+    for p in paths:
+        hits = []
+        if not os.path.exists(p) and any(c in p for c in "*?["):
+            hits = sorted(glob.glob(p))
+        for q in (hits or [p]):
+            if q not in out:
+                out.append(q)
+    return out
 
 
 def _list_checks() -> str:
@@ -122,6 +142,11 @@ def _main(argv: List[str] | None = None) -> int:
         print("reldoctor: error: give a dist directory or artifact files", file=sys.stderr)
         return 2
 
+    args.paths = expand_globs(args.paths)
+    if args.jobs is not None and args.jobs < 1:
+        print("reldoctor: --jobs must be at least 1", file=sys.stderr)
+        return 2
+
     cfg: dict = {}
     cfg_dir = os.getcwd()
     if not args.no_config:
@@ -138,7 +163,8 @@ def _main(argv: List[str] | None = None) -> int:
     if cfg.get("strict"):
         args.strict = True
     args.ignore = list(cfg.get("ignore", [])) + args.ignore
-    args.allow_path = list(cfg.get("allow-path", [])) + args.allow_path
+    # Windows users type tests\\certs\\*; archive member names always use forward slashes
+    args.allow_path = [a.replace("\\", "/") for a in list(cfg.get("allow-path", [])) + args.allow_path]
     args.against = [a if os.path.isabs(a) else os.path.join(cfg_dir, a) for a in cfg.get("against", [])] + args.against
     if args.max_members is None:
         args.max_members = cfg.get("max-members", doctor.DEFAULT_MAX_MEMBERS)
@@ -180,14 +206,21 @@ def _main(argv: List[str] | None = None) -> int:
         return 2
 
     findings = [f for f in findings if f.code not in ignored]
+    try:
+        _w, _s, _z, _d = doctor._iter_artifacts(args.paths)
+        checked = [os.path.basename(x) for x in _w + _s + _z]
+    except (OSError, ValueError):
+        checked = []
     errors = sum(f.severity == "error" for f in findings)
     warns = sum(f.severity == "warn" for f in findings)
     failed = bool(errors or (args.strict and warns))
 
     fmt = "json" if args.json else args.format
+    if fmt in ("sarif", "junit", "markdown"):
+        from . import formats   # xml.sax pulls in urllib.request: ~0.1 s of start-up the text/json paths never need
     if fmt == "json":
         text = json.dumps({"errors": errors, "warnings": warns, "passed": not failed,
-                           "findings": [f.as_dict() for f in findings]}, indent=2)
+                           "checked": checked, "findings": [f.as_dict() for f in findings]}, indent=2)
     elif fmt == "github":
         text = _render_github(findings, errors, warns, failed)
     elif fmt == "sarif":
@@ -197,9 +230,9 @@ def _main(argv: List[str] | None = None) -> int:
     elif fmt == "markdown":
         text = formats.to_markdown(findings, failed, errors, warns)
     else:
-        text = _render_text(findings, errors, warns, failed)
+        text = _render_text(findings, errors, warns, failed, checked)
     try:
-        _write(text)
+        _write(text, utf8=fmt != "text")
     except BrokenPipeError:  # e.g. `reldoctor dist/ | head`; the exit code still counts
         try:
             sys.stdout = open(os.devnull, "w")
@@ -211,11 +244,18 @@ def _main(argv: List[str] | None = None) -> int:
     return 1 if failed else 0
 
 
-def _write(text: str) -> None:
+def _write(text: str, utf8: bool = False) -> None:
     """Print without ever failing on a console that cannot show a character (cp1252
-    on Windows, LANG=C in a container): unprintable characters come out as \\uXXXX."""
+    on Windows, LANG=C in a container): unprintable characters come out as \\uXXXX.
+
+    ``utf8``: the machine formats (json, github, sarif, junit, markdown) are read by programs
+    that expect UTF-8 (GitHub's runner, SARIF and JUnit consumers). Redirecting them on Windows
+    would otherwise write cp1252 bytes under a "UTF-8" label."""
     try:
-        sys.stdout.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+        if utf8:
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
+        else:
+            sys.stdout.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
     except (AttributeError, ValueError, OSError):
         pass
     try:

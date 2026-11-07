@@ -371,7 +371,10 @@ def test_non_ascii_names_never_crash_on_an_ascii_console(tmp_path, fmt):
     r = run_cli([str(tmp_path), "--format", fmt], env={"PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"})
     assert r.returncode == 1, r.stderr.decode()
     assert b"Traceback" not in r.stderr
-    assert b"\\xe9" in r.stdout or b"\\u00e9" in r.stdout or fmt in ("json", "sarif")
+    if fmt in ("github", "junit"):     # round 4: machine formats are UTF-8 whatever the console says
+        assert "caf\u00e9" in r.stdout.decode("utf-8")
+    else:
+        assert b"\\xe9" in r.stdout or b"\\u00e9" in r.stdout or fmt in ("json", "sarif")
 
 
 @pytest.mark.skipif(not os.path.exists("/dev/full"), reason="needs /dev/full")

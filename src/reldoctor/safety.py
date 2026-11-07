@@ -160,6 +160,8 @@ _NEEDLES = {
     "database URL with password": (b"://",),
 }
 SECRET_PATTERNS = [(kind, re.compile(src.encode()), _NEEDLES[kind]) for kind, src in _TOKEN_SOURCES]
+# one pass over a file decides whether ANY of the 22 patterns can match, instead of 36 separate `in` scans
+_ANY_NEEDLE = re.compile(b"|".join(re.escape(n) for _k, _r, ns in SECRET_PATTERNS for n in ns))
 _TEXT_PATTERNS = [(kind, re.compile(src)) for kind, src in _TOKEN_SOURCES]
 _TEXT_PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----")
 
@@ -211,6 +213,8 @@ def _has_private_key(blob: bytes) -> bool:
 def scan_secrets(blob: bytes) -> List[str]:
     """Kinds of secrets found in blob (deduplicated, in pattern order)."""
     kinds = ["private key"] if (b"PRIVATE KEY" in blob and _has_private_key(blob)) else []
+    if not _ANY_NEEDLE.search(blob):
+        return kinds
     for kind, rx, needles in SECRET_PATTERNS:
         if not any(n in blob for n in needles):
             continue

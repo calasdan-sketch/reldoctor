@@ -207,20 +207,29 @@ def packaging_problems(raw_text: str) -> Optional[List[str]]:
 
 def render_problem(meta: email.message.Message, text: str) -> Optional[str]:
     """Why readme_renderer cannot render the description, or None (also None when not installed)."""
+    import io
+    import warnings
     ctype = (meta.get("Description-Content-Type") or "text/x-rst").split(";")[0].strip().lower()
     try:
-        if ctype == "text/markdown":
-            import readme_renderer.markdown as r
-        elif ctype == "text/x-rst":
-            import readme_renderer.rst as r
-        else:
-            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # readme_renderer warns on import when its Markdown extra is missing
+            if ctype == "text/markdown":
+                import readme_renderer.markdown as r
+            elif ctype == "text/x-rst":
+                import readme_renderer.rst as r
+            else:
+                return None
     except ImportError:
         return None
-    import io
+    if ctype == "text/markdown" and not getattr(r, "variants", True):
+        # readme_renderer >= 44 ships Markdown support as the optional `[md]` extra; without it
+        # every Markdown description "fails", which says nothing about the project.
+        return None
     stream = io.StringIO()
     try:
-        ok = r.render(text[:2_000_000], stream=stream)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ok = r.render(text[:2_000_000], stream=stream)
     except Exception as e:  # noqa: BLE001
         return f"renderer crashed ({type(e).__name__})"
     if ok is None:

@@ -128,7 +128,7 @@ def find_config(explicit: Optional[str], cwd: Optional[str] = None) -> Optional[
 def load(path: str) -> Tuple[Dict[str, Any], str]:
     """Validated settings of `path` and the directory relative paths resolve against."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:   # utf-8-sig: Notepad and some editors add a BOM
             text = fh.read(2_000_000)
     except OSError as e:
         raise ConfigError(f"cannot read {path}: {e.strerror or e}") from None

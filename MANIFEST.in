@@ -1,0 +1,7 @@
+include CHANGELOG.md LICENSE README.md
+graft tests
+graft bench
+graft tools
+prune bench/__pycache__
+prune tests/__pycache__
+global-exclude *.pyc __pycache__

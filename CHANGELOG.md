@@ -5,6 +5,39 @@
 Expert round 2: PyPI-maintainer, supply-chain, release-engineering and wheel-tag review, with a
 committed benchmark (`bench/`, results in `bench/RESULTS.md`).
 
+### Round 4 (additions on this unreleased line)
+Specialists: a first-hour user following only the README, a release/packaging engineer, a supply-chain reviewer, a
+docs/DX writer, a CI integrator, a hostile-input fuzzer, a performance engineer, a Windows packager, a competitor's maintainer
+(written up, with the command that proved each finding, in `docs/ROUND4.md`). Two passes: build, then attack the result.
+
+- Fixed: `reldoctor[render]` / `[all]` called **every Markdown description broken** (`description_render_failed`) with
+  `readme_renderer` 44 or newer, because that release moved Markdown support into its own `[md]` extra. The extras now ask
+  for `readme_renderer[md]`, and an installed `readme_renderer` that cannot render Markdown stays silent instead of failing
+  the release. (On a machine with the broken combination, 39 of the repository's own tests failed and 24 of 25 good
+  releases in the benchmark were reported as errors.)
+- Fixed: wildcards such as `dist/*.whl` were passed through unexpanded by Windows shells and reported as "no such file";
+  reldoctor now expands them itself (a name that exists is never treated as a pattern).
+- Fixed: `--format junit|markdown|github|json|sarif` wrote the console's code page (cp1252 on Windows) under a "UTF-8" label;
+  these formats are now always UTF-8. The human `text` format is unchanged (unprintable characters still come out as `\uXXXX`).
+- Fixed: a `pyproject.toml` / `--config` file saved with a byte-order mark (Windows editors) was rejected; `--jobs 0` and
+  negative values were accepted silently (now a usage error); `--allow-path 'tests\certs\*'` written with backslashes never
+  matched (archive names use `/`; backslashes are now accepted and converted).
+- Added: the text report ends with `checked N file(s): ...` and the JSON report has a `"checked"` list, so a clean run shows which
+  files were actually looked at.
+- Added packaging polish a stranger sees on PyPI: author `Calas Automations Inc.`, Homepage and Issues URLs, Python 3.9-3.13,
+  OS-independent, Beta, Quality Assurance and Typing classifiers, a `py.typed` marker, `MANIFEST.in` (the sdist now carries the
+  changelog, tests and the `bench/` files the tests import, so the tests pass from the sdist), and the LICENSE copyright line.
+- Added `bench/demo.py` (`python -m bench.demo OUT`) which builds the broken release behind the README's sample output, with a test
+  that keeps the sample true; tests that keep version, author, URLs and classifiers consistent between `pyproject.toml`, the
+  changelog, `__version__` and the LICENSE, and that the repository passes its own leak scan.
+- Faster: one regular-expression pass decides whether any of the 22 secret patterns can match a file (1.5x to 13x faster than the
+  36 separate substring scans on 32 MiB buffers); the SARIF/JUnit/Markdown module (and `urllib.request`, `xml.sax` with it) is no
+  longer imported for text and JSON output. Median per real wheel 0.95 s against 1.08 s for the previous code in the same run.
+- CI: the workflow now also runs Python 3.10 and a `windows-latest` job (not yet seen passing), and installs the built wheel into a
+  clean virtual environment and runs it from another directory.
+- Changed: the bench corpus builds its fake database URL at runtime (the sdist now ships `bench/`, and reldoctor flagged its own
+  release for it).
+
 ### Round 3 (additions on this unreleased line)
 Specialists: a malicious-package author, a secret-scanner engineer, a release engineer with a wheel matrix,
 a Windows packager, a docs/DX lead, a performance engineer. Two passes: build, then review of the new code.

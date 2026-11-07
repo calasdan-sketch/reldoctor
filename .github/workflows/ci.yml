@@ -7,11 +7,19 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.12", "3.13"]
+        include:
+          # Windows has been reviewed by reading the code only; this job is the first real run
+          - os: windows-latest
+            python-version: "3.12"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,4 +37,12 @@ jobs:
         run: twine check dist/*
       - name: Self-audit (release doctor)
         run: reldoctor dist/ --strict --format github
-
+      - name: Install the built wheel into a clean environment and run it from elsewhere
+        run: |
+          python -m venv "$RUNNER_TEMP/clean"
+          if [ -d "$RUNNER_TEMP/clean/Scripts" ]; then BIN="$RUNNER_TEMP/clean/Scripts"; else BIN="$RUNNER_TEMP/clean/bin"; fi
+          "$BIN/python" -m pip install dist/*.whl
+          mkdir -p "$RUNNER_TEMP/elsewhere" && cd "$RUNNER_TEMP/elsewhere"
+          "$BIN/reldoctor" --version
+          "$BIN/python" -m reldoctor --list-checks | head -3
+          "$BIN/reldoctor" "$GITHUB_WORKSPACE/dist/" --strict
