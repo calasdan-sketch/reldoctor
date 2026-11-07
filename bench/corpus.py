@@ -478,5 +478,86 @@ def _(d):
     return prev
 
 
+# =========================== round 3 ===========================
+
+def _zip_of(members):
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+_GH = frag("ghp", "_") + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5"
+
+leak("leak_secret_utf16", "acme_widgets/settings.txt", ("TOKEN=" + _GH + "\r\n").encode("utf-16"), {"secret_in_file"})
+leak("leak_secret_in_bundled_zip", "acme_widgets/fixtures.zip", _zip_of({"cfg.py": ("T = '" + _GH + "'\n").encode()}),
+     {"secret_in_file"})
+leak("leak_dotenv_in_bundled_zip", "acme_widgets/fixtures.zip", _zip_of({".env": b"DEBUG=1\n"}), {"sensitive_file"})
+leak("leak_testpypi_token", "acme_widgets/cfg.py",
+     ("T = '" + frag("pypi-", "AgENdGVzdC5weXBpLm9yZw") + "Ik" + "aB3" * 20 + "'\n").encode(), {"secret_in_file"})
+leak("leak_shopify_token", "acme_widgets/cfg.py", ("S = '" + frag("shp", "at_") + "a1b2c3d4e5f60718293a4b5c6d7e8f90'\n").encode(),
+     {"secret_in_file"})
+leak("leak_kubeconfig", "acme_widgets/kubeconfig", b"apiVersion: v1\n", {"sensitive_file"})
+leak("leak_docker_config", "acme_widgets/.docker/config.json", b"{}", {"sensitive_file"})
+leak("leak_credentials_json_name", "acme_widgets/credentials.json", b"{}", {"maybe_sensitive_file"}, "supply")
+
+
+@case("binary_glibcxx_too_new", "bad", "binary", {"manylinux_glibcxx_too_new"}, False,
+      source="auditwheel 6.8.2 policy/manylinux-policy.json (GLIBCXX per policy)")
+def _(d):
+    pair(d, tag="cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64",
+         files={"acme_widgets/_s.cpython-312-x86_64-linux-gnu.so": elf(62, "GLIBC_2.17", glibcxx="GLIBCXX_3.4.26")})
+
+
+@case("good_manylinux_cxx_within_policy", "good", "good")
+def _(d):
+    pair(d, tag="cp312-cp312-manylinux_2_28_x86_64",
+         files={"acme_widgets/_s.cpython-312-x86_64-linux-gnu.so": elf(62, "GLIBC_2.17", glibcxx="GLIBCXX_3.4.24")})
+
+
+@case("release_stale_wheel", "bad", "integrity", {"wheel_source_drift"}, False,
+      note="a wheel left in dist/ from an earlier commit")
+def _(d):
+    b.build_wheel(_dist(d), tag="cp312-cp312-win_amd64", files={"acme_widgets/core.py": b"x = 1\n"})
+    b.build_wheel(_dist(d), tag="cp312-cp312-win32", files={"acme_widgets/core.py": b"x = 2\n"})
+
+
+@case("release_wheel_metadata_differs", "bad", "integrity", {"wheel_metadata_drift"}, False)
+def _(d):
+    b.build_wheel(_dist(d), tag="py3-none-any")
+    b.build_wheel(_dist(d), tag="cp312-cp312-win32", meta=Mutator(add=[("Requires-Dist", "extra-dep>=1")]))
+
+
+@case("windows_long_path", "bad", "supply", {"long_path"}, False)
+def _(d):
+    rel(d, wheel=dict(files={"acme_widgets/" + "d" * 90 + "/" + "e" * 90 + "/mod.py": b"x = 1\n"}))
+
+
+@case("good_bundled_zip_clean", "good", "good", note="a data archive with ordinary files")
+def _(d):
+    rel(d, wheel=dict(files={"acme_widgets/data.zip": _zip_of({"table.csv": b"a,b\n1,2\n", "notes.txt": b"hello"})}))
+
+
+@case("good_utf16_text", "good", "good", note="UTF-16 text without secrets")
+def _(d):
+    rel(d, wheel=dict(files={"acme_widgets/readme_win.txt": "Plain notes written on Windows.\r\n".encode("utf-16")}))
+
+
+@case("good_secret_words_in_docs", "good", "good", note="docs that talk about credentials are not credentials")
+def _(d):
+    rel(d, wheel=dict(files={"acme_widgets/docs/credentials.rst": b"How to rotate credentials\n",
+                             "acme_widgets/token_utils.py": b"def token(): return 1\n"}))
+
+
+@case("good_matching_wheel_matrix", "good", "good")
+def _(d):
+    for tag, mach in (("win_amd64", 0x8664), ("win32", 0x14C)):
+        b.build_wheel(_dist(d), tag=f"cp312-cp312-{tag}",
+                      files={"acme_widgets/core.py": b"x = 1\n", f"acme_widgets/_s.cp312-{tag}.pyd": pe(mach)})
+    b.build_sdist(_dist(d))
+
+
 GOOD = [c for c in CASES if c.kind == "good"]
 BAD = [c for c in CASES if c.kind == "bad"]

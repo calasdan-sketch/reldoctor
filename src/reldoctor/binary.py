@@ -103,6 +103,7 @@ def _macho_thin(head: bytes, base: int) -> Optional[BinInfo]:
 
 # Symbol-version strings in an ELF's dynamic string table.
 GLIBC_REF = re.compile(rb"GLIBC_(\d+)\.(\d+)")
+GLIBCXX_REF = re.compile(rb"GLIBCXX_3\.4\.(\d+)")
 MUSL_HINT = re.compile(rb"ld-musl-|libc\.musl-")
 GLIBC_NEEDED = re.compile(rb"libc\.so\.6")
 
@@ -123,3 +124,20 @@ def ext_abi_tag(name: str) -> Optional[Tuple[str, Optional[Tuple[int, int]]]]:
     if re.search(r"\.(?:so|pyd)$", base):
         return "none", None
     return None
+
+
+# Newest GLIBCXX_3.4.N symbol version each manylinux policy allows, from auditwheel 6.8.2's
+# `policy/manylinux-policy.json` (the x86_64/i686/aarch64/armv7l/riscv64 entries; ppc64le and s390x
+# use a different version scheme there and are not checked). Keys are the policy's glibc version.
+GLIBCXX_POLICY = {
+    (2, 5): 8, (2, 12): 13, (2, 17): 19, (2, 24): 22, (2, 26): 22, (2, 27): 24, (2, 28): 24,
+    (2, 31): 28, (2, 34): 29, (2, 35): 30, (2, 36): 30, (2, 37): 30, (2, 38): 30, (2, 39): 33,
+    (2, 40): 33, (2, 41): 33,
+}
+GLIBCXX_ARCHS = {"x86_64", "x86", "arm64", "arm", "riscv64"}
+
+
+def glibcxx_allowed(glibc_floor: Tuple[int, int]) -> Optional[int]:
+    """N of the newest GLIBCXX_3.4.N the manylinux policy at `glibc_floor` allows, or None below the oldest."""
+    keys = [k for k in GLIBCXX_POLICY if k <= glibc_floor]
+    return GLIBCXX_POLICY[max(keys)] if keys else None

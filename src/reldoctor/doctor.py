@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from . import diff as _diff
-from . import metacheck, supply, wheelcheck
+from . import metacheck, nested, supply, wheelcheck
 from .binary import sniff
 from .reqs import parse_requirement
 from .safety import (
@@ -36,6 +36,7 @@ from .safety import (
     redact,
     resolve_link_escapes,
     sensitive_file_kind,
+    maybe_sensitive_file_kind,
     unsafe_path_reason,
 )
 
@@ -57,6 +58,7 @@ MARKDOWN_VARIANTS = {"GFM", "CommonMark"}  # packaging.metadata, case-sensitive
 # warehouse forklift/metadata.py SUPPORTED_METADATA_VERSIONS
 SUPPORTED_METADATA_VERSIONS = {"1.0", "1.1", "1.2", "2.1", "2.2", "2.3", "2.4", "2.5"}
 DIST_FIELDS = ("Requires-Dist", "Provides-Dist", "Obsoletes-Dist")
+MAX_MEMBER_PATH = 200           # Windows MAX_PATH is 260, and site-packages takes ~60-80 of it
 MAX_SUMMARY_LENGTH = 512        # warehouse _LENGTH_LIMITS
 MAX_VERSION_LENGTH = 128        # warehouse MAX_VERSION_LENGTH
 MAX_PROJECT_URL_LABEL = 32      # warehouse project-url label limit
@@ -101,6 +103,11 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     # leaks and junk
     "sensitive_file": ("error", "a credential file (.env, .pypirc, SSH key...) is shipped"),
     "secret_in_file": ("error", "a file contains a token or private key"),
+    "nested_archive_partial": ("warn", "a zip/tar bundled inside the release was too deep, large or full to "
+                                       "inspect completely"),
+    "long_path": ("warn", "a member path over 200 characters can pass Windows' 260-character limit once installed"),
+    "maybe_sensitive_file": ("warn", "a file named like credentials or secrets (credentials.json, secrets.yml, "
+                                     "local_settings.py, *.env...) is shipped"),
     "vcs_metadata_shipped": ("warn", ".git/.hg/.svn directory shipped"),
     "junk_file": ("warn", "tool caches, editor dirs or OS junk shipped"),
     "bytecode_shipped": ("warn", "wheel ships .pyc/__pycache__"),
@@ -158,6 +165,10 @@ CHECKS: Dict[str, Tuple[str, str]] = {
     "version_drift": ("error", "artifacts disagree on version"),
     "name_drift": ("error", "artifacts are for different projects"),
     "metadata_drift": ("warn", "wheel and sdist metadata disagree (dependencies, Requires-Python...)"),
+    "wheel_metadata_drift": ("warn", "wheels of one release disagree on dependencies, Requires-Python, license or "
+                                     "summary (stale wheel from another commit?)"),
+    "wheel_source_drift": ("warn", "the same Python file has different content in two wheels of one release "
+                                   "(stale wheel from another commit?)"),
 }
 
 for _mod in (metacheck, supply, wheelcheck, _diff):
@@ -368,6 +379,8 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
     junk: Set[str] = set()
     vcs = False
     unnormalized: List[str] = []
+    maybe_files: List[Tuple[str, str]] = []
+    long_paths: List[str] = []
     for n in names:
         reason = unsafe_path_reason(n)
         if reason:
@@ -384,9 +397,15 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
                 out.append(_f("case_collision", f"{folded[low]!r} and {key!r} differ only by case", label))
             folded.setdefault(low, key)
         seen.add(key)
+        if len(key) > MAX_MEMBER_PATH:
+            long_paths.append(key)
         kind = sensitive_file_kind(key)
         if kind and not path_allowed(key, allow):
             out.append(_f("sensitive_file", f"{key!r} looks like a {kind}; it would be public on PyPI", label))
+        elif not kind and not path_allowed(key, allow) and not key.endswith("/"):
+            maybe = maybe_sensitive_file_kind(key)
+            if maybe:
+                maybe_files.append((key, maybe))
         parts = key.split("/")
         if any(p in VCS_DIRS for p in parts[:-1]) or parts[-1] in VCS_DIRS:
             vcs = True
@@ -394,6 +413,16 @@ def check_member_names(names: List[str], label: str, allow: Tuple[str, ...] = ()
             parts[-1] if parts[-1] in JUNK_FILES else None)
         if hit:
             junk.add(hit)
+    if long_paths:
+        out.append(_f("long_path",
+                      f"{len(long_paths)} member path(s) are over {MAX_MEMBER_PATH} characters (longest "
+                      f"{max(map(len, long_paths))}); installed under site-packages they can pass Windows' "
+                      "260-character path limit and fail to install there", label))
+    if maybe_files:
+        shown = ", ".join(f"{k!r} ({why})" for k, why in maybe_files[:3])
+        out.append(_f("maybe_sensitive_file",
+                      f"{len(maybe_files)} file(s) are usually credentials or secrets: {shown}. If they are "
+                      "harmless data, exempt them with --allow-path", label))
     if unnormalized:
         out.append(_f("path_not_normalized",
                       f"{len(unnormalized)} member path(s) are not normalized (e.g. {unnormalized[0]!r}); "
@@ -507,6 +536,28 @@ def _file_findings(name: str, size: int, sc: StreamScanner, label: str, allowed:
     if size >= _LARGE_FILE and not wheelcheck.binary_is_library(name):
         out.append(_f("large_file", f"{name!r} is {size:,} bytes; confirm it belongs in a package", label))
     return out
+
+
+def _nested_findings(data: bytes, name: str, label: str, allow: Tuple[str, ...], agg: _Agg,
+                     limits: "nested.Limits") -> List[Finding]:
+    """Credentials inside an archive that is itself a file of the release."""
+    out: List[Finding] = []
+    for display, size, sc, sens in nested.inspect(data, name, limits):
+        if path_allowed(display, allow):
+            continue
+        if sens:
+            out.append(_f("sensitive_file", f"{display!r} looks like a {sens}; it would be public on PyPI", label))
+        out.extend(_file_findings(display, size, sc, label, False, agg))
+    return out
+
+
+def _nested_partial(limits: "nested.Limits", label: str) -> List[Finding]:
+    if not limits.skipped:
+        return []
+    return [_f("nested_archive_partial",
+               f"{limits.skipped} bundled archive(s) or member(s) were not fully inspected (deeper than "
+               f"{nested.MAX_DEPTH} levels, over {nested.MAX_NESTED_BYTES // (1024 * 1024)} MiB, or too many "
+               "members); secret coverage inside them is partial", label)]
 
 
 def _secret_findings(name: str, kinds: List[str], label: str) -> List[Finding]:
@@ -726,6 +777,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
         # every file is streamed once, in overlapping chunks, within the budget:
         # secrets, personal paths, obfuscated code, native-library headers
         agg = _Agg()
+        nlimits = nested.Limits()
         natives: List[wheelcheck.NativeFile] = []
         for info in files:
             if not budget.take(info.file_size):
@@ -738,12 +790,23 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                 continue
             out.extend(_file_findings(info.filename, info.file_size, sc, fname,
                                       path_allowed(info.filename, allow), agg))
+            if sc.head and not path_allowed(info.filename, allow) and nested.archive_kind(sc.head, info.filename):
+                if info.file_size > nested.MAX_NESTED_BYTES:
+                    nlimits.skipped += 1
+                else:
+                    try:
+                        with zf.open(info) as fp:
+                            blob = fp.read(info.file_size)
+                    except _ZIP_READ_ERRORS:
+                        blob = b""
+                    out.extend(_nested_findings(blob, info.filename, fname, allow, agg, nlimits))
             bi = sniff(sc.head) if sc.head else None
             if bi is not None and wheelcheck.binary_is_library(info.filename):
-                natives.append(wheelcheck.NativeFile(info.filename, bi, sc.glibc_max, sc.musl, sc.glibc_needed))
+                natives.append(wheelcheck.NativeFile(info.filename, bi, sc.glibc_max, sc.musl, sc.glibc_needed, sc.glibcxx_max))
             if info.filename.endswith(".pth") and info.file_size <= 65536:
                 out.extend(_fp(supply.analyze_pth(info.filename, sc.head.decode("utf-8", "replace")), fname))
         out.extend(agg.findings(fname))
+        out.extend(_nested_partial(nlimits, fname))
         if budget.exhausted:
             out.append(_f("archive_too_large",
                           f"more than {MAX_ARCHIVE_READ} bytes of content; hash/secret checks are partial", fname))
@@ -875,6 +938,7 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
 
     budget = _Budget()
     agg = _Agg()
+    nlimits = nested.Limits()
     pkg_info = f"{root}/PKG-INFO"
     if pkg_info not in file_set:
         out.append(_f("sdist_no_pkg_info", "sdist lacks PKG-INFO", fname))
@@ -929,8 +993,17 @@ def _check_sdist_members(tf: tarfile.TarFile, members: List[tarfile.TarInfo], fn
         fp = tf.extractfile(source)
         if fp is None:
             continue
-        out.extend(_file_findings(n, source.size, _scan_stream(fp, n), fname, False, agg))
+        sc = _scan_stream(fp, n)
+        out.extend(_file_findings(n, source.size, sc, fname, False, agg))
+        if sc.head and nested.archive_kind(sc.head, n):
+            if source.size > nested.MAX_NESTED_BYTES:
+                nlimits.skipped += 1
+            else:
+                fp2 = tf.extractfile(source)
+                if fp2 is not None:
+                    out.extend(_nested_findings(fp2.read(source.size), n, fname, allow, agg, nlimits))
     out.extend(agg.findings(fname))
+    out.extend(_nested_partial(nlimits, fname))
     if budget.exhausted:
         out.append(_f("archive_too_large",
                       f"more than {MAX_ARCHIVE_READ} bytes of content; secret scan is partial", fname))
@@ -988,6 +1061,68 @@ def check_drift(wheel_metas: List[Tuple[str, email.message.Message]],
     return out
 
 
+def _wheel_fingerprint(path: str) -> Optional[Tuple[email.message.Message, Dict[str, str]]]:
+    """METADATA and {python-source path: RECORD hash} of one wheel, read cheaply and bounded."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_MEMBERS:
+                return None
+            tops = [i.filename for i in infos if i.filename.endswith(".dist-info/METADATA") and i.filename.count("/") == 1]
+            if len(tops) != 1:
+                return None
+            dist = tops[0].rsplit("/", 1)[0]
+            with zf.open(tops[0]) as fp:
+                mdata = _read_capped(fp, MAX_METADATA_BYTES)
+            rec = ""
+            if f"{dist}/RECORD" in {i.filename for i in infos}:
+                with zf.open(f"{dist}/RECORD") as fp:
+                    rdata = _read_capped(fp, MAX_METADATA_BYTES)
+                rec = rdata.decode("utf-8", "replace") if rdata is not None else ""
+    except Exception:  # noqa: BLE001 - unreadable wheels are reported by check_wheel
+        return None
+    if mdata is None:
+        return None
+    hashes: Dict[str, str] = {}
+    try:
+        for row in csv.reader(io.StringIO(rec)):
+            if len(row) > 1 and row[0].endswith(".py") and ".dist-info/" not in row[0] \
+                    and row[1].lower().startswith("sha256="):
+                hashes[row[0]] = row[1]
+    except csv.Error:
+        pass
+    return parse_metadata(mdata.decode("utf-8", "replace")), hashes
+
+
+def check_wheel_consistency(wheels: List[str]) -> List[Finding]:
+    """Wheels of one release must come from one build: a stale wheel left in dist/
+    from an earlier commit shows up as metadata or Python source that differs."""
+    prints = [(os.path.basename(w), fp) for w in wheels for fp in [_wheel_fingerprint(w)] if fp]
+    if len(prints) < 2:
+        return []
+    out: List[Finding] = []
+    ref_name, (ref_meta, ref_src) = prints[0]
+    for name, (meta, src) in prints[1:]:
+        diffs = []
+        for field in ("Summary", "Requires-Python", "License-Expression", "License"):
+            if (meta.get(field) or "").strip() != (ref_meta.get(field) or "").strip():
+                diffs.append(field)
+        for field in ("Requires-Dist", "Provides-Extra"):
+            if {x.strip() for x in meta.get_all(field, [])} != {x.strip() for x in ref_meta.get_all(field, [])}:
+                diffs.append(field)
+        if diffs:
+            out.append(_f("wheel_metadata_drift",
+                          f"{name} and {ref_name} are the same release but disagree on {', '.join(diffs)}; "
+                          "one of them was probably built from a different commit (stale file in dist/?)", name))
+        changed = sorted(p for p in set(src) & set(ref_src) if src[p] != ref_src[p])
+        if changed:
+            out.append(_f("wheel_source_drift",
+                          f"{len(changed)} Python file(s) differ between {name} and {ref_name} (e.g. {changed[0]!r}); "
+                          "wheels of one release should ship the same source. Rebuild from a clean dist/ "
+                          "(generated per-platform files are fine: --ignore wheel_source_drift)", name))
+    return out
+
+
 def _iter_artifacts(paths: Iterable[str]) -> Tuple[List[str], List[str], List[str], List[str]]:
     wheels, sdists, zips, dirs = [], [], [], []
     for p in paths:
@@ -1017,12 +1152,67 @@ def _iter_artifacts(paths: Iterable[str]) -> Tuple[List[str], List[str], List[st
     return wheels, sdists, zips, dirs
 
 
-def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[str] = ()) -> List[Finding]:
+def _check_one(job: Tuple[str, str, Tuple[str, ...], int]) -> List[Finding]:
+    kind, path, allow, max_members = job
+    global MAX_MEMBERS
+    MAX_MEMBERS = max_members      # a spawned worker starts from the default; the CLI value travels with the job
+    return check_wheel(path, allow) if kind == "wheel" else check_sdist(path, allow)
+
+
+PARALLEL_MIN_BYTES = 64 * 1024 * 1024    # below this a process pool costs more than it saves
+
+
+def _auto_jobs(paths: List[str]) -> int:
+    try:
+        total = sum(os.path.getsize(p) for p in paths)
+    except OSError:
+        return 1
+    if len(paths) < 3 or total < PARALLEL_MIN_BYTES:
+        return 1
+    return max(1, min(4, os.cpu_count() or 1, len(paths)))
+
+
+def auto_jobs_for(paths: Iterable[str]) -> int:
+    """Worker count the CLI uses when --jobs is not given."""
+    try:
+        wheels, sdists, _z, _o = _iter_artifacts(list(paths))
+    except (OSError, ValueError):
+        return 1
+    return _auto_jobs(wheels + sdists)
+
+
+LAST_RUN_PARALLEL = False    # whether the last _run_checks really used worker processes (for tests)
+
+
+def _run_checks(jobs_list: List[Tuple[str, str, Tuple[str, ...], int]], jobs: int) -> List[List[Finding]]:
+    """Findings per artifact, in input order. A process pool is used when `jobs` > 1
+    and silently replaced by a sequential run if the platform cannot start one."""
+    global LAST_RUN_PARALLEL
+    LAST_RUN_PARALLEL = False
+    if jobs > 1 and len(jobs_list) > 1:
+        try:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            # "spawn" behaves the same on every OS (no fork of a threaded parent) and keeps tests honest
+            with ProcessPoolExecutor(max_workers=min(jobs, len(jobs_list)),
+                                     mp_context=multiprocessing.get_context("spawn")) as pool:
+                results = list(pool.map(_check_one, jobs_list))
+            LAST_RUN_PARALLEL = True
+            return results
+        except Exception:  # noqa: BLE001 - BrokenProcessPool, OSError, pickling: fall back, never lose a check
+            pass
+    return [_check_one(j) for j in jobs_list]
+
+
+def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[str] = (),
+             jobs: int = 1) -> List[Finding]:
     """Diagnose artifacts given as files and/or directories of artifacts.
 
     `allow` is a list of member-path globs (e.g. "tests/certs/*") exempt
     from the credential-file and secret checks only. `against` is the previous
     release (directories and/or files) for the offline release-diff checks.
+    `jobs` is the number of worker processes (default 1: in-process; the CLI picks
+    automatically for big releases, see `_auto_jobs`).
     """
     paths = list(paths)
     allow = tuple(allow)
@@ -1045,8 +1235,11 @@ def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[
     versions: Set[str] = set()
     projects: Set[str] = set()
     wheel_metas, sdist_metas = [], []
+    todo = [("wheel", w, allow, MAX_MEMBERS) for w in wheels] + [("sdist", x, allow, MAX_MEMBERS) for x in sdists]
+    results = _run_checks(todo, jobs)
+    by_path = {(k, p): r for (k, p, _a, _m), r in zip(todo, results)}
     for w in wheels:
-        out.extend(check_wheel(w, allow))
+        out.extend(by_path[("wheel", w)])
         parts = os.path.basename(w).split("-")
         if len(parts) > 1:
             projects.add(normalize(parts[0]))
@@ -1055,7 +1248,7 @@ def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[
         if meta is not None:
             wheel_metas.append((os.path.basename(w), meta))
     for s in sdists:
-        out.extend(check_sdist(s, allow))
+        out.extend(by_path[("sdist", s)])
         m = _SDIST_NAME.match(os.path.basename(s))
         if m:
             projects.add(normalize(m.group("name")))
@@ -1068,6 +1261,7 @@ def diagnose(paths: Iterable[str], allow: Iterable[str] = (), against: Iterable[
     if len(versions) > 1:
         out.append(_f("version_drift", f"artifacts disagree on version: {sorted(versions)}"))
     out.extend(check_drift(wheel_metas, sdist_metas))
+    out.extend(check_wheel_consistency(wheels))
 
     if not wheels:  # sdist-only upload: PyPI validates its PKG-INFO fields, so do the table checks here
         for sname, smeta in sdist_metas:

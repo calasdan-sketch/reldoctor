@@ -26,6 +26,7 @@ CHECKS_EXTRA: Dict[str, Tuple[str, str]] = {
     "binary_arch_mismatch": ("error", "a compiled library's CPU architecture does not match the wheel's platform tag"),
     "binary_os_mismatch": ("error", "a compiled library is for a different operating system than the wheel's platform tag"),
     "manylinux_glibc_too_new": ("error", "a library needs a newer glibc than the manylinux tag promises"),
+    "manylinux_glibcxx_too_new": ("error", "a library needs a newer libstdc++ (GLIBCXX_3.4.N) than the manylinux tag allows"),
     "musllinux_links_glibc": ("error", "a musllinux wheel contains a library linked against glibc"),
     "manylinux_links_musl": ("error", "a manylinux wheel contains a library linked against musl"),
     "macos_target_too_new": ("error", "a library needs a newer macOS than the macosx tag promises"),
@@ -44,6 +45,7 @@ class NativeFile:
     glibc_max: Optional[Tuple[int, int]] = None
     musl: bool = False
     glibc_needed: bool = False
+    glibcxx_max: Optional[int] = None
 
 
 def check_dist_info_name(fname: str, dist_dir: str) -> List[Pair]:
@@ -120,6 +122,15 @@ def check_wheel_tags_vs_contents(
                             f"{n.name!r} references GLIBC_{n.glibc_max[0]}.{n.glibc_max[1]} but the tag promises "
                             f"glibc {floor[0]}.{floor[1]}; `auditwheel repair` would relabel it "
                             f"manylinux_{n.glibc_max[0]}_{n.glibc_max[1]}"))
+        if gl and n.glibcxx_max is not None and (n.info.archs & binary.GLIBCXX_ARCHS):
+            floor = min(pi.libc_min for pi in gl)
+            allowed = binary.glibcxx_allowed(floor)
+            if allowed is not None and n.glibcxx_max > allowed:
+                out.append(("manylinux_glibcxx_too_new",
+                            f"{n.name!r} references GLIBCXX_3.4.{n.glibcxx_max} but the manylinux policy for glibc "
+                            f"{floor[0]}.{floor[1]} allows up to GLIBCXX_3.4.{allowed} (auditwheel's policy data); "
+                            "systems with an older libstdc++ cannot import it. Build in the matching manylinux "
+                            "image or run `auditwheel repair`"))
         if any(pi.libc == "musl" for pi in same_os) and n.glibc_needed:
             out.append(("musllinux_links_glibc",
                         f"{n.name!r} is linked against libc.so.6 (glibc) but the wheel is musllinux"))
@@ -177,6 +188,11 @@ def packaging_problems(raw_text: str) -> Optional[List[str]]:
         import packaging
         from packaging.metadata import Metadata
     except ImportError:
+        return None
+    # packaging before 24.2 does not know Metadata 2.4 (PEP 639) and would reject every modern
+    # wheel; an oracle that is out of date must stay silent rather than call valid files broken.
+    ver = re.match(r"(\d+)\.(\d+)", str(getattr(packaging, "__version__", "")))
+    if not ver or (int(ver.group(1)), int(ver.group(2))) < (24, 2):
         return None
     try:
         Metadata.from_email(raw_text, validate=True)

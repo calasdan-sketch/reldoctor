@@ -87,7 +87,7 @@ def build_tools(args) -> List[Tool]:
         Reldoctor("reldoctor --strict", os.path.join(ROOT, "src"), strict=True),
     ]
     if args.baseline_src:
-        tools.append(Reldoctor("reldoctor 0.2.0 (before)", args.baseline_src))
+        tools.append(Reldoctor(args.baseline_label, args.baseline_src))
     v = args.tools_venv
     for t in (External("twine check", v, "twine", ["check"]),
               External("twine check --strict", v, "twine", ["check", "--strict"]),
@@ -199,6 +199,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tools-venv", help="virtualenv with twine, check-wheel-contents, pydistcheck, auditwheel installed")
     ap.add_argument("--baseline-src", help="src/ dir of an older reldoctor to score as 'before'")
+    ap.add_argument("--baseline-label", default="reldoctor (before)", help="name of the baseline row")
     ap.add_argument("--real", action="store_true", help="also run the real-wheel set (network)")
     ap.add_argument("--keep", help="build the corpus under this directory and keep it")
     ap.add_argument("--out", default=HERE)

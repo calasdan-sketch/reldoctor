@@ -7,6 +7,7 @@ message is passed through `redact()` before it leaves the library.
 """
 from __future__ import annotations
 
+import codecs
 import fnmatch
 import posixpath
 import re
@@ -106,7 +107,8 @@ _PEM_MAX_HEADERS = 64    # headers examined per chunk (bounds work on hostile in
 _TOKEN_SOURCES: List[Tuple[str, str]] = [
     ("AWS access key id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     ("GitHub token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b"),
-    ("PyPI API token", r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
+    # pypi.org tokens start with the base64 of "pypi.org", test.pypi.org tokens with that of "test.pypi.org"
+    ("PyPI API token", r"\bpypi-(?:AgEIcHlwaS5vcmc|AgENdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}"),
     # real Slack tokens carry numeric team/user ids: xoxb-<digits>-<digits>-<secret>
     ("Slack token", r"\bxox[abposr]-[0-9]{6,}-[0-9A-Za-z-]{8,}"),
     ("Slack webhook", r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}"),
@@ -118,6 +120,14 @@ _TOKEN_SOURCES: List[Tuple[str, str]] = [
     ("SendGrid API key", r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
     ("GitLab token", r"\bglpat-[A-Za-z0-9_-]{20,}"),
     ("Hugging Face token", r"\bhf_[A-Za-z0-9]{34,}\b"),
+    ("Shopify access token", r"\bshp(?:at|ca|pa|ss)_[a-f0-9]{32}\b"),
+    ("Docker Hub access token", r"\bdckr_pat_[A-Za-z0-9_-]{27,}"),
+    ("DigitalOcean token", r"\bdo[opr]_v1_[a-f0-9]{64}\b"),
+    ("Databricks token", r"\bdapi[a-f0-9]{32}(?:-\d)?\b"),
+    ("HashiCorp Vault token", r"\bhv[sbr]\.[A-Za-z0-9_-]{24,}"),
+    ("Discord webhook",
+     r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}"),
+    ("Azure storage account key", r"\bAccountKey=[A-Za-z0-9+/]{86}=="),
     ("npm auth token in .npmrc", r"_authToken\s*=\s*[A-Za-z0-9_\-./+=]{16,}"),
     ("database URL with password",
      r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^\s:/@'\"<>]+:[^\s/@'\"<>]{4,}@[^\s'\"<>/]+"),
@@ -128,7 +138,7 @@ _TOKEN_SOURCES: List[Tuple[str, str]] = [
 _NEEDLES = {
     "AWS access key id": (b"AKIA", b"ASIA"),
     "GitHub token": (b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"),
-    "PyPI API token": (b"pypi-AgEI",),
+    "PyPI API token": (b"pypi-AgEI", b"pypi-AgEN"),
     "Slack token": (b"xox",),
     "Slack webhook": (b"hooks.slack.com",),
     "Google API key": (b"AIza",),
@@ -139,6 +149,13 @@ _NEEDLES = {
     "SendGrid API key": (b"SG.",),
     "GitLab token": (b"glpat-",),
     "Hugging Face token": (b"hf_",),
+    "Shopify access token": (b"shpat_", b"shpca_", b"shppa_", b"shpss_"),
+    "Docker Hub access token": (b"dckr_pat_",),
+    "DigitalOcean token": (b"_v1_",),
+    "Databricks token": (b"dapi",),
+    "HashiCorp Vault token": (b"hvs.", b"hvb.", b"hvr."),
+    "Discord webhook": (b"/api/webhooks/",),
+    "Azure storage account key": (b"AccountKey=",),
     "npm auth token in .npmrc": (b"_authToken",),
     "database URL with password": (b"://",),
 }
@@ -158,12 +175,15 @@ _DB_PLACEHOLDER = re.compile(
     rb"@(?:localhost|127\.0\.0\.1|0\.0\.0\.0|host|hostname|example\.\w+|db|database|redis|postgres)(?=[:/?\s'\"]|$)")
 
 
+_TOKEN_PREFIX = re.compile(rb"^[A-Za-z]{2,6}(?:_[a-z]{2,6})?_")
+
+
 def _is_placeholder(token: bytes) -> bool:
     if b"://" in token and _DB_PLACEHOLDER.search(token):
         return True
     if token.startswith(b"_authToken") or token.startswith(b"_authtoken"):
         return bool(re.search(rb"\$\{|\$[A-Z_]+|<|xxxx|XXXX|your", token))
-    body = token.split(b"_", 1)[-1] if token.startswith((b"gh", b"github_pat")) else token
+    body = _TOKEN_PREFIX.sub(b"", token, count=1) if token.startswith((b"gh", b"github_pat")) or _TOKEN_PREFIX.match(token) else token
     if _PLACEHOLDER_WORDS.search(token):
         return True
     return len(set(body)) < 6
@@ -223,6 +243,25 @@ _OBFUSCATED_EXEC = re.compile(
 ELF_MAGIC = b"\x7fELF"
 
 
+def utf16_codec(head: bytes) -> Optional[str]:
+    """The codec name when `head` looks like UTF-16 text (a BOM, or every other byte
+    NUL in a text-looking sample), else None. Native libraries do not match."""
+    if head.startswith(b"\xff\xfe") and not head.startswith(b"\xff\xfe\x00\x00"):
+        return "utf-16"
+    if head.startswith(b"\xfe\xff"):
+        return "utf-16"
+    sample = head[:4096]
+    if len(sample) < 32:
+        return None
+    even, odd = sample[0::2], sample[1::2]
+    z_even, z_odd = even.count(0) / len(even), odd.count(0) / len(odd)
+    if z_odd > 0.3 and z_even < 0.02:
+        return "utf-16-le"
+    if z_even > 0.3 and z_odd < 0.02:
+        return "utf-16-be"
+    return None
+
+
 def _mask_user(name: str) -> str:
     return name[:1] + "***"
 
@@ -246,20 +285,33 @@ class StreamScanner:
         self.glibc_max: Optional[Tuple[int, int]] = None
         self.musl = False
         self.glibc_needed = False
+        self.glibcxx_max: Optional[int] = None
         self._elf = False
         self._tail = b""
         self._first = True
         self._is_py = name.endswith((".py", ".pyw"))
+        self._u16 = None          # incremental UTF-16 decoder when the file is UTF-16 text
+        self._tail16 = b""
 
     def feed(self, chunk: bytes) -> None:
         if self._first:
             self._first = False
             self.head = chunk[:65536]
             self._elf = chunk.startswith(ELF_MAGIC)
+            codec = utf16_codec(chunk)
+            if codec:
+                self._u16 = codecs.getincrementaldecoder(codec)(errors="ignore")
         blob = self._tail + chunk
         for k in scan_secrets(blob):
             if k not in self.kinds:
                 self.kinds.append(k)
+        if self._u16 is not None:
+            # PowerShell's `>` and many Windows editors write UTF-16: scan the text view too
+            text = (self._tail16 + self._u16.decode(chunk).encode("utf-8", "ignore"))
+            for k in scan_secrets(text):
+                if k not in self.kinds:
+                    self.kinds.append(k)
+            self._tail16 = text[-SCAN_OVERLAP:]
         if len(self.local_users) < self.MAX_PATHS and (b"/home/" in blob or b"/Users/" in blob or b"Users\\" in blob):
             for m in _LOCAL_PATH.finditer(blob):
                 user = next(g for g in m.groups() if g).decode("utf-8", "replace")
@@ -272,7 +324,12 @@ class StreamScanner:
                 and _OBFUSCATED_EXEC.search(blob):
             self.obfuscated = True
         if self._elf:
-            from .binary import GLIBC_NEEDED, GLIBC_REF, MUSL_HINT
+            from .binary import GLIBC_NEEDED, GLIBC_REF, GLIBCXX_REF, MUSL_HINT
+            if b"GLIBCXX_3.4." in blob and "libstdc++" not in self.name:   # the library itself defines them
+                for m in GLIBCXX_REF.finditer(blob):
+                    n = int(m.group(1))
+                    if self.glibcxx_max is None or n > self.glibcxx_max:
+                        self.glibcxx_max = n
             if b"GLIBC_" in blob:
                 for m in GLIBC_REF.finditer(blob):
                     v = (int(m.group(1)), int(m.group(2)))
@@ -313,7 +370,31 @@ SENSITIVE_BASENAMES = {
     "id_dsa": "SSH private key",
     "id_ecdsa": "SSH private key",
     "id_ed25519": "SSH private key",
+    "kubeconfig": "Kubernetes credentials",
+    ".boto": "boto/GCS credentials",
+    ".vault-token": "HashiCorp Vault token",
+    ".bash_history": "shell history (often holds pasted secrets)",
+    ".zsh_history": "shell history (often holds pasted secrets)",
+    ".python_history": "interpreter history (often holds pasted secrets)",
+    ".psql_history": "psql history (often holds passwords)",
+    ".mysql_history": "mysql history (often holds passwords)",
+    "application_default_credentials.json": "Google Cloud credentials",
+    "serviceAccountKey.json": "cloud service-account key",
+    "wallet.dat": "cryptocurrency wallet",
 }
+# names that are credentials in practice but can also be harmless data: warn, do not fail
+MAYBE_SENSITIVE_BASENAMES = {
+    "credentials.json": "credentials file", "secrets.json": "secrets file", "secrets.yml": "secrets file",
+    "secrets.yaml": "secrets file", "secrets.toml": "secrets file", "token.json": "OAuth token file",
+    "cookies.txt": "browser cookie export", "local_settings.py": "local settings (usually holds secrets)",
+    "settings_local.py": "local settings (usually holds secrets)", ".envrc": "direnv file (often exports secrets)",
+    "master.key": "Rails master key",
+}
+_SENSITIVE_PATTERNS = [
+    (re.compile(r"^client_secrets?[\w.-]*\.json$", re.I), "OAuth client secret"),
+    (re.compile(r"^[\w.-]*-firebase-adminsdk-[\w.-]*\.json$", re.I), "Firebase admin key"),
+    (re.compile(r"^service[-_]?account[\w.-]*\.json$", re.I), "cloud service-account key"),
+]
 SENSITIVE_SUFFIXES = {
     ".p12": "PKCS#12 key bundle", ".pfx": "PKCS#12 key bundle", ".jks": "Java keystore",
     ".keystore": "Java keystore", ".kdbx": "KeePass database", ".tfvars": "Terraform variables file",
@@ -342,6 +423,24 @@ def sensitive_file_kind(name: str) -> Optional[str]:
         return "dotenv file"
     if len(parts) >= 2 and parts[-2] == ".aws" and base in {"credentials", "config"}:
         return "AWS credentials"
+    if len(parts) >= 2 and parts[-2] == ".docker" and base == "config.json":
+        return "Docker registry credentials"
+    if len(parts) >= 2 and parts[-2] == ".kube" and base == "config":
+        return "Kubernetes credentials"
+    for rx, why in _SENSITIVE_PATTERNS:
+        if rx.match(base):
+            return why
+    return None
+
+
+def maybe_sensitive_file_kind(name: str) -> Optional[str]:
+    """Classify a member path as possibly holding credentials (warn-level), or None."""
+    base = name.rstrip("/").rsplit("/", 1)[-1]
+    if base in MAYBE_SENSITIVE_BASENAMES:
+        return MAYBE_SENSITIVE_BASENAMES[base]
+    low = base.lower()
+    if low.endswith(".env") and len(low) > 4 and low[:-4] not in _ENV_TEMPLATES:
+        return "dotenv-style file"
     return None
 
 

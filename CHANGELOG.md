@@ -5,7 +5,32 @@
 Expert round 2: PyPI-maintainer, supply-chain, release-engineering and wheel-tag review, with a
 committed benchmark (`bench/`, results in `bench/RESULTS.md`).
 
-### Added
+### Round 3 (additions on this unreleased line)
+Specialists: a malicious-package author, a secret-scanner engineer, a release engineer with a wheel matrix,
+a Windows packager, a docs/DX lead, a performance engineer. Two passes: build, then review of the new code.
+
+- Added: `[tool.reldoctor]` settings in `pyproject.toml` (`strict`, `ignore`, `allow-path`, `against`,
+  `max-members`; `--config`, `--no-config`); `--explain CODE`; `--format markdown`; `--jobs` (parallel scan,
+  automatic for big releases); stable SARIF `partialFingerprints`.
+- Added leak coverage: secrets inside zip/tar/gzip/bzip2/xz files bundled in a release (`nested.py`, bounded;
+  `nested_archive_partial` when something was too deep, large or encrypted to open); UTF-16 text (PowerShell's `>`);
+  TestPyPI, Shopify, Docker Hub, DigitalOcean, Databricks, Vault and Discord-webhook tokens and Azure storage keys;
+  credential file names (kubeconfig, `.docker/config.json`, cloud service-account keys, shell histories...) and the
+  warning-level `maybe_sensitive_file` (`credentials.json`, `secrets.yml`, `local_settings.py`, `*.env`...).
+- Added `manylinux_glibcxx_too_new`: newest `GLIBCXX_3.4.N` in an ELF library against the limit of the wheel's manylinux
+  policy (table from auditwheel 6.8.2's policy data; vendored `libstdc++` files are not judged).
+- Added release checks: `wheel_metadata_drift` and `wheel_source_drift` (a stale wheel from another commit in
+  `dist/`), `long_path` (member paths over 200 characters; Windows' 260-character limit).
+- Fixed: the README link scan took minutes on a hostile long description (quadratic regular expressions;
+  now bounded and tested); a non-ASCII file name crashed the report with a traceback on a `LANG=C` or
+  cp1252 console (now written with `\uXXXX` escapes); an unwritable report or an internal error no longer exits
+  with the "findings" code (`2` and `3`); TestPyPI tokens were not recognised; `python -m reldoctor` is safe to
+  re-import by worker processes.
+- Fixed: with `packaging` older than 24.2 installed (it does not know Metadata 2.4), `reldoctor[all]` called every
+  modern wheel broken; the oracle now stays silent below 24.2 and the extra requires `packaging>=24.2`.
+- Changed: `--max-members` defaults from the settings file when not given; checks 131 -> 137.
+
+### Added (round 2)
 - **Wheel tags versus contents** (`wheelcheck.py`, `binary.py`, `platform_tags.py`): reads ELF,
   Mach-O (thin and fat) and PE headers and compares them with the wheel's platform tag. New checks:
   `binary_arch_mismatch`, `binary_os_mismatch`, `manylinux_glibc_too_new` (newest `GLIBC_x.y` symbol

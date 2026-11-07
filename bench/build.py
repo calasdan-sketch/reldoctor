@@ -34,7 +34,8 @@ def frag(*parts: str) -> str:
 # --- native binary headers -------------------------------------------------
 
 def elf(machine: int = 62, glibc: Optional[str] = "GLIBC_2.17", musl: bool = False,
-        needed_glibc: bool = True, big_endian: bool = False, size: int = 4096) -> bytes:
+        needed_glibc: bool = True, big_endian: bool = False, size: int = 4096,
+        glibcxx: Optional[str] = None) -> bytes:
     e = ">" if big_endian else "<"
     hdr = b"\x7fELF" + bytes([2, 2 if big_endian else 1, 1, 0]) + b"\0" * 8
     hdr += struct.pack(e + "HHI", 3, machine, 1)
@@ -42,6 +43,8 @@ def elf(machine: int = 62, glibc: Optional[str] = "GLIBC_2.17", musl: bool = Fal
     strings = b"\0"
     if glibc:
         strings += glibc.encode() + b"\0"
+    if glibcxx:
+        strings += glibcxx.encode() + b"\0"
     if needed_glibc:
         strings += b"libc.so.6\0"
     if musl:

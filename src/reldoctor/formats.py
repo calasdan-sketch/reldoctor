@@ -1,6 +1,7 @@
 """Machine-readable report formats: SARIF 2.1.0 and JUnit XML."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Dict, Tuple
@@ -26,6 +27,9 @@ def to_sarif(findings, checks: Dict[str, Tuple[str, str]], version: str) -> str:
             "ruleId": f.code, "ruleIndex": index[f.code], "level": level[f.severity],
             "message": {"text": _clean(f.message)},
             "locations": [{"physicalLocation": {"artifactLocation": {"uri": _uri(f.file or "dist")}}}],
+            # a stable identity lets GitHub code scanning match the same finding across runs
+            "partialFingerprints": {"reldoctor/v1": hashlib.sha256(
+                f"{f.code}\0{f.file}\0{f.message}".encode("utf-8", "replace")).hexdigest()[:32]},
         })
     doc = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -61,3 +65,23 @@ def to_junit(findings, strict: bool) -> str:
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<testsuite name="reldoctor" tests="{len(cases)}" failures="{failures}" errors="0">\n'
             + "\n".join(cases) + "\n</testsuite>")
+
+
+def to_markdown(findings, failed: bool, errors: int, warns: int) -> str:
+    """A table for $GITHUB_STEP_SUMMARY or a pull-request comment."""
+    from .safety import escape_terminal
+
+    def cell(text: str) -> str:
+        text = escape_terminal(text).replace("|", "\\|").replace("`", "'").replace("<", "&lt;").replace(">", "&gt;")
+        for ch in "[]()!*_~":
+            text = text.replace(ch, "\\" + ch)
+        return text
+
+    head = f"### reldoctor: {'FAIL' if failed else 'PASS'} ({errors} error(s), {warns} warning(s))"
+    if not findings:
+        return head
+    rows = ["| | check | file | what |", "|---|---|---|---|"]
+    mark = {"error": "x", "warn": "!", "info": "i"}
+    for f in findings:
+        rows.append(f"| {mark.get(f.severity, '?')} | `{f.code}` | {cell(f.file)} | {cell(f.message)} |")
+    return head + "\n\n" + "\n".join(rows)

@@ -322,10 +322,12 @@ def check_url_fields(meta: email.message.Message) -> List[Pair]:
 # --- README rendering hazards ----------------------------------------------
 
 _FENCE = re.compile(r"^\s*(```|~~~)")
-_MD_LINK = re.compile(r"!?\[[^\]]*\]\(\s*<?([^)\s>]+)")
-_HTML_SRC = re.compile(r"""<(?:img|a|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"']+)["']""", re.I)
+# Quantifiers are bounded: an unclosed `[` or `<img` repeated a hundred thousand
+# times would otherwise make these quadratic on a hostile long description.
+_MD_LINK = re.compile(r"!?\[[^\]]{0,300}\]\(\s{0,20}<?([^)\s>]{1,2000})")
+_HTML_SRC = re.compile(r"""<(?:img|a|source)\b[^>]{0,500}?\b(?:src|href)\s{0,20}=\s{0,20}["']([^"']{1,2000})["']""", re.I)
 _RST_IMAGE = re.compile(r"^\s*\.\. (?:image|figure)::\s+(\S+)", re.M)
-_RST_LINK = re.compile(r"`[^`<]*<([^>]+)>`_{1,2}")
+_RST_LINK = re.compile(r"`[^`<\n]{0,300}<([^>\s`<]{1,2000})>`_{1,2}")
 _RST_TARGET = re.compile(r"^\s*\.\. _[^:]+:\s+(\S+)", re.M)
 _ABSOLUTE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:|//|#|\{|\$)")
 
@@ -347,7 +349,8 @@ def relative_links(text: str, content_type: str) -> List[str]:
                 continue
             if in_fence:
                 continue
-            line = re.sub(r"`[^`]*`", "", line)
+            line = line[:20000]
+            line = re.sub(r"`[^`]{0,300}`", "", line)
             found += [m.group(1) for m in _MD_LINK.finditer(line)]
             found += [m.group(1) for m in _HTML_SRC.finditer(line)]
     if "rst" in ctype or not ctype:

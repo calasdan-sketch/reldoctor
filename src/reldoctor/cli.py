@@ -8,6 +8,7 @@ import sys
 from typing import List
 
 from . import __version__
+from . import config as _config
 from . import doctor
 from .doctor import CHECKS, UNIGNORABLE, Finding, diagnose
 from . import formats
@@ -50,7 +51,36 @@ def _list_checks() -> str:
     return "\n".join(f"{sev.upper():5} {code:{width}}  {desc}" for code, (sev, desc) in CHECKS.items())
 
 
+def _explain(code: str) -> int:
+    from .advice import advice_for
+    if code not in CHECKS:
+        print(f"reldoctor: unknown check code {escape_terminal(code)!r}; see --list-checks", file=sys.stderr)
+        return 2
+    sev, desc = CHECKS[code]
+    print(f"{code}  ({sev})\n\n{desc}\n")
+    print("Can be silenced with --ignore: " + ("no, the gate stays closed" if code in UNIGNORABLE else "yes"))
+    fix = advice_for(code)
+    if fix:
+        print(f"\nWhat to do: {fix}")
+    return 0
+
+
 def main(argv: List[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("reldoctor: interrupted", file=sys.stderr)
+        return 2
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - never a bare traceback with the "findings" exit code
+        print(f"reldoctor: internal error ({type(e).__name__}): {escape_terminal(str(e))[:300]}. "
+              "The release was NOT approved. Please report this with the artifact type that triggered it.",
+              file=sys.stderr)
+        return 3
+
+
+def _main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="reldoctor",
         description="Audit wheel + sdist the way PyPI and pip will see them.",
@@ -58,9 +88,9 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("paths", nargs="*", metavar="PATH",
                     help="dist directory and/or .whl / .tar.gz files (e.g. dist/)")
     ap.add_argument("--strict", action="store_true", help="warnings also fail")
-    ap.add_argument("--format", choices=["text", "json", "github", "sarif", "junit"], default="text",
+    ap.add_argument("--format", choices=["text", "json", "github", "sarif", "junit", "markdown"], default="text",
                     help="output format; 'github' emits Actions annotations, 'sarif' SARIF 2.1.0 for code "
-                         "scanning, 'junit' JUnit XML")
+                         "scanning, 'junit' JUnit XML, 'markdown' a table for $GITHUB_STEP_SUMMARY")
     ap.add_argument("--against", action="append", default=[], metavar="PATH",
                     help="previous release (directory or files, e.g. from `pip download PROJECT==OLD --no-deps`): "
                          "report size jumps, new dependencies, new commands, dropped wheels. Offline.")
@@ -70,8 +100,14 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--allow-path", action="append", default=[], metavar="GLOB",
                     help="exempt archive paths matching GLOB from the secret/credential checks "
                          "(e.g. 'tests/certs/*'); repeatable")
-    ap.add_argument("--max-members", type=int, default=doctor.DEFAULT_MAX_MEMBERS, metavar="N",
+    ap.add_argument("--max-members", type=int, default=None, metavar="N",
                     help=f"refuse archives with more than N members (default {doctor.DEFAULT_MAX_MEMBERS})")
+    ap.add_argument("--jobs", type=int, default=None, metavar="N",
+                    help="worker processes for big releases (default: automatic for 3+ artifacts over 64 MiB; "
+                         "1 turns it off)")
+    ap.add_argument("--config", metavar="FILE", help="read [tool.reldoctor] from FILE instead of ./pyproject.toml")
+    ap.add_argument("--no-config", action="store_true", help="ignore ./pyproject.toml")
+    ap.add_argument("--explain", metavar="CODE", help="describe one check code and how to fix it, then exit")
     ap.add_argument("--list-checks", action="store_true", help="print every check code and exit")
     ap.add_argument("--version", action="version", version=f"reldoctor {__version__}")
     args = ap.parse_args(argv)
@@ -79,15 +115,38 @@ def main(argv: List[str] | None = None) -> int:
     if args.list_checks:
         print(_list_checks())
         return 0
+    if args.explain:
+        return _explain(args.explain.strip())
     if not args.paths:
         ap.print_usage(sys.stderr)
         print("reldoctor: error: give a dist directory or artifact files", file=sys.stderr)
         return 2
 
+    cfg: dict = {}
+    cfg_dir = os.getcwd()
+    if not args.no_config:
+        cfg_path = _config.find_config(args.config)
+        if cfg_path:
+            try:
+                cfg, cfg_dir = _config.load(cfg_path)
+            except _config.ConfigError as e:
+                print(f"reldoctor: {escape_terminal(cfg_path)}: {escape_terminal(str(e))} "
+                      "(--no-config skips the file)", file=sys.stderr)
+                return 2
+            if cfg:
+                print(f"reldoctor: using [tool.reldoctor] from {escape_terminal(cfg_path)}", file=sys.stderr)
+    if cfg.get("strict"):
+        args.strict = True
+    args.ignore = list(cfg.get("ignore", [])) + args.ignore
+    args.allow_path = list(cfg.get("allow-path", [])) + args.allow_path
+    args.against = [a if os.path.isabs(a) else os.path.join(cfg_dir, a) for a in cfg.get("against", [])] + args.against
+    if args.max_members is None:
+        args.max_members = cfg.get("max-members", doctor.DEFAULT_MAX_MEMBERS)
+
     ignored = {c.strip() for group in args.ignore for c in group.split(",") if c.strip()}
     unknown = sorted(ignored - set(CHECKS))
     if unknown:
-        print(f"reldoctor: unknown check code(s) for --ignore: {', '.join(map(escape_terminal, unknown))}",
+        print(f"reldoctor: unknown check code(s) to ignore: {', '.join(map(escape_terminal, unknown))}",
               file=sys.stderr)
         return 2
     locked = sorted(ignored & UNIGNORABLE)
@@ -109,7 +168,8 @@ def main(argv: List[str] | None = None) -> int:
     try:
         saved, doctor.MAX_MEMBERS = doctor.MAX_MEMBERS, args.max_members
         try:
-            findings = diagnose(args.paths, allow=args.allow_path, against=args.against)
+            findings = diagnose(args.paths, allow=args.allow_path, against=args.against,
+                                jobs=doctor.auto_jobs_for(args.paths) if args.jobs is None else args.jobs)
         finally:
             doctor.MAX_MEMBERS = saved
     except FileNotFoundError as e:
@@ -134,17 +194,36 @@ def main(argv: List[str] | None = None) -> int:
         text = formats.to_sarif(findings, CHECKS, __version__)
     elif fmt == "junit":
         text = formats.to_junit(findings, args.strict)
+    elif fmt == "markdown":
+        text = formats.to_markdown(findings, failed, errors, warns)
     else:
         text = _render_text(findings, errors, warns, failed)
     try:
-        print(text)
-        sys.stdout.flush()
+        _write(text)
     except BrokenPipeError:  # e.g. `reldoctor dist/ | head`; the exit code still counts
         try:
             sys.stdout = open(os.devnull, "w")
         except OSError:
             pass
+    except OSError as e:     # disk full, closed descriptor: say so, and do not look like "findings found"
+        print(f"reldoctor: cannot write the report: {e.strerror or e}", file=sys.stderr)
+        return 2
     return 1 if failed else 0
+
+
+def _write(text: str) -> None:
+    """Print without ever failing on a console that cannot show a character (cp1252
+    on Windows, LANG=C in a container): unprintable characters come out as \\uXXXX."""
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode(getattr(sys.stdout, "encoding", None) or "ascii", "backslashreplace")
+              .decode(getattr(sys.stdout, "encoding", None) or "ascii", "replace"))
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":  # pragma: no cover

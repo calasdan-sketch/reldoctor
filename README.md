@@ -35,18 +35,19 @@ ERROR manylinux_glibc_too_new [...] '..._speed.cpython-312-x86_64-linux-gnu.so' 
 
 ## What it checks
 
-`reldoctor --list-checks` prints all 130+ check codes with their severity. In groups:
+`reldoctor --list-checks` prints all 137 check codes with their severity. In groups:
 
 | Area | Examples |
 |---|---|
 | **Will PyPI accept it?** | rules taken from PyPI's own upload code (warehouse `forklift/legacy.py`, `forklift/metadata.py`, `utils/wheel.py`) and `packaging.metadata`: direct URLs or unparseable PEP 508 strings in `Requires-`/`Provides-`/`Obsoletes-Dist`; unsupported `Metadata-Version`; invalid or deprecated trove classifiers; invalid SPDX `License-Expression`; `License` + `License-Expression` and missing `License-File`s (PEP 639); platform tags off PyPI's accept-list (`linux_x86_64`); non-normalized wheel names and `.dist-info` dirs; invalid author emails and `Dynamic` fields; `Description-Content-Type`; `+local` and over-long versions; Summary over 512 chars; Project-URL labels over 32 chars; non-normalized member paths; bzip2/lzma wheel members; zip-bomb ratios; GNU sparse tar members; files over 100 MiB |
-| **Does the wheel tell the truth?** | native libraries are read (ELF, Mach-O thin and fat, PE) and compared with the platform tag: CPU architecture, operating system, newest `GLIBC_x.y` against the manylinux floor, glibc-vs-musl, macOS deployment target against `macosx_X_Y`, `cpython-3NN` extension suffix against the `cpNNN`/`abi3` tag, `Requires-Python` against the `cpXY` tag, `Root-Is-Purelib`, platform tag with no compiled code |
-| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`, `.npmrc`, `.p12`/`.jks`, `terraform.tfstate`; PEM private keys (also `\n`-escaped inside JSON), AWS, GitHub, GitLab, PyPI, npm, Slack, Google, Stripe live, OpenAI, Anthropic, SendGrid and Hugging Face tokens, database URLs with passwords, inside files of any size (including content reached through sdist hardlinks). Documented examples and placeholders (`AKIAIOSFODNN7EXAMPLE`, `${NPM_TOKEN}`) are ignored. Personal home-directory paths (`/home/<user>/`, `C:\Users\<user>\`) in compiled code and configs, source maps, SQLite files. Secret values and URL credentials are redacted from every message |
+| **Does the wheel tell the truth?** | native libraries are read (ELF, Mach-O thin and fat, PE) and compared with the platform tag: CPU architecture, operating system, newest `GLIBC_x.y` and `GLIBCXX_3.4.N` against the manylinux floor (policy data from auditwheel), glibc-vs-musl, macOS deployment target against `macosx_X_Y`, `cpython-3NN` extension suffix against the `cpNNN`/`abi3` tag, `Requires-Python` against the `cpXY` tag, `Root-Is-Purelib`, platform tag with no compiled code |
+| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`, `.docker/config.json`, kubeconfigs, cloud service-account keys, shell histories, `.npmrc`, `.p12`/`.jks`, `terraform.tfstate` (and, as warnings, `credentials.json`, `secrets.yml`, `local_settings.py`, `*.env`...); PEM private keys (also `\n`-escaped inside JSON), AWS, GitHub, GitLab, PyPI and TestPyPI, npm, Slack, Discord, Google, Stripe live, OpenAI, Anthropic, SendGrid, Hugging Face, Shopify, Docker Hub, DigitalOcean, Databricks and Vault tokens, Azure storage keys, database URLs with passwords, inside files of any size (including content reached through sdist hardlinks), inside UTF-16 text (what PowerShell's `>` writes), and inside zip / tar / gzip / bzip2 / xz files bundled in the release (two levels deep, bounded). Documented examples and placeholders (`AKIAIOSFODNN7EXAMPLE`, `${NPM_TOKEN}`) are ignored. Personal home-directory paths (`/home/<user>/`, `C:\Users\<user>\`) in compiled code and configs, source maps, SQLite files. Secret values and URL credentials are redacted from every message |
 | **Install-time code** | `setup.py` parsed with `ast` (never run) for network calls, hidden `exec(base64...)` payloads and subprocess use; `.pth` files that run code at every Python start; obfuscated `exec()`/`eval()` in any module; console scripts named `pip`, `sudo`, `ls`...; top-level modules that shadow the standard library; top-level `tests/` or `docs/`; project name one edit from a top-1,500 PyPI project |
 | **Release diff** (`--against`) | same filename already released (PyPI never accepts a re-upload), size jump, new or removed dependencies, `Requires-Python` raised, new or removed console scripts, new native/`.pth`/script files, vanished packages, a platform wheel that was published last time and is missing now, license change |
 | **Integrity** | every RECORD row's sha256 and size against the real file, files missing from / extra to RECORD, md5/sha1 hashes, malformed RECORD CSV, duplicate zip entries |
 | **Archive safety** | absolute, `..`, drive-letter and backslash member paths; sdist symlinks escaping the tree, following chains of links; dangling hardlinks; device/FIFO members; names that collide on case-insensitive filesystems; symlink mode bits in wheels; a member cap (`--max-members`, default 100,000) |
 | **Metadata quality** | Name/Version vs filename, Summary, Requires-Python vs `Programming Language :: Python :: X.Y` classifiers, license, long description and content type, relative links in the README, undeclared extras, Project-URL format |
+| **Wheels of one release** | the same release must come from one build: metadata (`Requires-Dist`, `Requires-Python`, license, summary) or Python source that differs between the wheels in `dist/` points at a stale file from another commit |
 | **Wheel vs sdist** | project and version drift; Requires-Dist / Requires-Python / Summary drift when PKG-INFO is Metadata 2.2+ (fields marked `Dynamic` are skipped) |
 
 ## Usage
@@ -59,13 +60,39 @@ reldoctor dist/ --format json                # machine-readable (--json still wo
 reldoctor dist/ --format github              # GitHub Actions annotations
 reldoctor dist/ --format sarif > reldoctor.sarif   # GitHub code scanning / any SARIF viewer
 reldoctor dist/ --format junit > reldoctor.xml     # JUnit XML for CI dashboards
+reldoctor dist/ --format markdown >> "$GITHUB_STEP_SUMMARY"   # a table on the workflow run page
+reldoctor --explain secret_in_file           # what a check means and how to fix it
 reldoctor dist/ --against prev/              # also compare with the previous release (offline)
 python -m reldoctor dist/                    # same thing without the script on PATH
 reldoctor dist/ --ignore no_summary,dev_version
 reldoctor dist/ --allow-path 'tests/certs/*' # deliberate test keys: exempt from leak checks only
 ```
 
-Exit codes: `0` pass, `1` findings (errors, or warnings with `--strict`), `2` usage error.
+Exit codes: `0` pass, `1` findings (errors, or warnings with `--strict`), `2` usage error (including a report that
+could not be written), `3` internal error (the release is not approved; please report it).
+
+### Settings file
+
+Put your choices in `pyproject.toml` so the command line stays short:
+
+```toml
+[tool.reldoctor]
+strict = true                       # warnings fail too
+ignore = ["typosquat_name"]         # silence check codes (never the locked ones)
+allow-path = ["tests/certs/*"]      # deliberate fixtures, exempt from the leak checks only
+against = ["prev/"]                 # previous release, relative to this file
+max-members = 50000
+```
+
+Command-line `--ignore` / `--allow-path` / `--against` are added to these. The file is read from the directory
+you run in (never searched upward, never taken from the artifacts), `--config FILE` names another and `--no-config`
+skips it. A typo'd key or wrong type is an error, the locked checks stay locked and over-broad `allow-path` globs
+are still refused. If you audit artifacts from an untrusted pull request, run with `--no-config`: a
+config file can silence checks. On Python before 3.11 without `tomli`, only a plain `[tool.reldoctor]` table is read
+(anything else is an error, not silently skipped).
+
+Releases of three or more artifacts totalling over 64 MiB are scanned in parallel (up to 4 worker processes);
+`--jobs N` sets it and `--jobs 1` turns it off.
 
 The gate fails closed: an empty `dist/` fails, an unknown `--ignore` code is a usage error,
 an `--allow-path` glob broad enough to exempt ordinary source or credential files (`*`, `?*`,
@@ -79,6 +106,7 @@ unreadable members, malformed RECORD, too many members, missing METADATA/PKG-INF
 - run: python -m build
 - run: pip download "$PROJECT==$PREVIOUS_VERSION" --no-deps -d prev/ || true   # optional: release diff
 - run: reldoctor dist/ --strict --format github $( [ -d prev ] && echo "--against prev/" )
+- run: reldoctor dist/ --format markdown >> "$GITHUB_STEP_SUMMARY"   # optional: a readable table
 - run: twine upload dist/*
 ```
 
@@ -97,11 +125,11 @@ numbers as "what that tool does not look at"; the last two rows use real PyPI wh
 | | reldoctor 0.3.0 | [twine check][twine] 7.0.0 | [check-wheel-contents][cwc] 0.6.3 | [pydistcheck][pdc] 0.11.3 | [auditwheel show][aw] 6.8.2 |
 |---|---|---|---|---|---|
 | Synthetic releases PyPI itself rejects, flagged (24, rules cited per case) | **24** | 7 | 3 | 0 | n/a |
-| All 88 deliberately broken synthetic releases (errors only / warnings count too) | 74% / 100% | 8% | 8% | 1% | n/a |
-| False positives on 20 good synthetic releases | 0 | 0 | 0 | 0 | n/a |
+| All 100 deliberately broken synthetic releases (errors only / warnings count too) | 73% / 100% | 7% | 7% | 2% | n/a |
+| False positives on 25 good synthetic releases | 0 | 0 | 0 | 0 | n/a |
 | Real PyPI wheels re-labelled with a wrong platform tag, detected (12; credited only if the tool passes the genuine wheel) | **12** | 0 | 0 | 0 | 5 (Linux wheels only; cannot read the macOS and Windows ones) |
 | Unexplained false positives on 19 untouched real wheels | 0 (3 flagged for genuine rule hits) | not measured | not measured | not measured | not measured |
-| Median seconds per real wheel (incl. interpreter start) | 0.39 (0.26 before this release) | 0.28 | 0.19 | 1.14 | not measured |
+| Median seconds per real wheel (incl. interpreter start; shared, heavily loaded machine, so compare ratios) | 1.18 (1.17 at the start of round 3) | 0.91 | 0.71 | 3.24 | not measured |
 
 What the other tools are for, from their own documentation: `twine check` renders the long description the way
 PyPI does and validates metadata with `packaging`; check-wheel-contents lints wheel layout (W001-W202);
@@ -110,6 +138,8 @@ decides which manylinux tag a Linux wheel deserves and vendors shared libraries.
 [check-manifest][cm], [validate-pyproject][vp] and [abi3audit][a3] work on the source tree or on stable-ABI
 symbol use and are complementary (installed for the teardown, not scored). reldoctor does not re-implement
 rST rendering (install `reldoctor[render]`, or keep running `twine check`), layout linting, vendoring, or abi3 symbol audits.
+From pydistcheck's documented options it has no equivalent of `--inspect` (an archive summary), per-project size limits
+or the debug-symbols check (checked 2026-11-07 against `pydistcheck --help` 0.11.3).
 
 [twine]: https://twine.readthedocs.io/en/stable/#twine-check
 [cwc]: https://pypi.org/project/check-wheel-contents
@@ -141,8 +171,15 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
   real-but-intentional test keys (for example TLS test certificates); exempt those with `--allow-path`.
   `local_path_leak` ignores generic and CI user names and, for documentation and source files, needs the
   same name in three files before it speaks, so a single hard-coded path in one `.py` file is missed.
+- Bundled archives are opened for the secret scan only: zip, tar, gzip, bzip2 and xz, two levels deep, an archive
+  up to 64 MiB, 256 MiB decompressed and 50,000 members per artifact. Encrypted members, 7z/rar/zstd and anything
+  past those bounds are not inspected; a `nested_archive_partial` warning says so. Secrets that are base64-encoded,
+  compressed inside `.pyc` or split across string concatenations are not found.
+- UTF-16 text is recognised by its byte-order mark or a clear every-other-byte-zero pattern; UTF-32 and other encodings are not decoded.
+- `maybe_sensitive_file` and `long_path` are name-based heuristics (warnings); `wheel_source_drift` can fire on
+  files a build legitimately generates per platform (`--ignore wheel_source_drift`).
 - Binary checks read headers and the dynamic-symbol version strings; they do not resolve every
-  dependency the way `auditwheel` does (no external-library policy, no `GLIBCXX`/`CXXABI` check, no
+  dependency the way `auditwheel` does (no external-library policy, `GLIBCXX` but no `CXXABI` check, no
   RPATH or vendored-library audit) and do not verify abi3 symbol use (see `abi3audit`). Mach-O minimum
   OS is read only where a slice's load commands sit in the first 64 KiB.
 - `setup.py` analysis is static. It resolves import aliases but not `getattr` tricks or code in other
@@ -156,14 +193,16 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
   `archive_too_large` warning says hash/secret coverage is partial.
 - Version checking accepts canonical PEP 440 only, so non-normalized spellings like `1.0-rc1` are flagged.
 - Zip-format sdists are only flagged, not inspected.
-- reldoctor is about 1.5x slower than its previous version on real wheels (0.39 s against 0.26 s median)
-  and slower than `twine check` (0.28 s): it reads every byte of every file once and loads three data tables.
+- reldoctor is about 1.3x slower than `twine check` and 1.7x slower than `check-wheel-contents` on real wheels (same
+  benchmark run, shared machine): it reads every byte of every file once and loads three data tables. Round 3 added
+  checks without measurably slowing real wheels (1.18 s against 1.17 s median). The parallel scan for big releases
+  (`--jobs`) is tested for identical output but its speed-up was not measured: the 2-CPU machine used here was shared.
 
 ## Reproduce the benchmark
 
 ```bash
 python -m venv /tmp/tools && /tmp/tools/bin/pip install twine check-wheel-contents pydistcheck auditwheel
-python -m bench.run --tools-venv /tmp/tools          # synthetic corpus: 20 good + 88 broken releases
+python -m bench.run --tools-venv /tmp/tools          # synthetic corpus: 25 good + 100 broken releases
 python -m bench.run --tools-venv /tmp/tools --real   # + real PyPI wheels (downloads ~60 MB)
 ```
 
