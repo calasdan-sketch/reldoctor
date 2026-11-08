@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "reldoctor",
+          "version": "{VERSION}",
+          "organization": "Calas Automations Inc.",
+          "informationUri": "https://github.com/calasdan-sketch/reldoctor",
+          "rules": [
+            {
+              "id": "binary_arch_mismatch",
+              "name": "binary_arch_mismatch",
+              "shortDescription": {
+                "text": "a compiled library's CPU architecture does not match the wheel's platform tag"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
+              "id": "diff_new_files",
+              "name": "diff_new_files",
+              "shortDescription": {
+                "text": "files added since the previous release"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "invalid_classifier",
+              "name": "invalid_classifier",
+              "shortDescription": {
+                "text": "a Classifier is not in the trove list; PyPI rejects it"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
+              "id": "local_path_leak",
+              "name": "local_path_leak",
+              "shortDescription": {
+                "text": "files contain a personal home-directory path (/home/<user>/, C:\\Users\\<user>\\)"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "manylinux_glibc_too_new",
+              "name": "manylinux_glibc_too_new",
+              "shortDescription": {
+                "text": "a library needs a newer glibc than the manylinux tag promises"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
+              "id": "readme_relative_links",
+              "name": "readme_relative_links",
+              "shortDescription": {
+                "text": "the long description links to relative paths; they break on PyPI"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "sdist_version",
+              "name": "sdist_version",
+              "shortDescription": {
+                "text": "the version found in PKG-INFO"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "secret_in_file",
+              "name": "secret_in_file",
+              "shortDescription": {
+                "text": "a file contains a token or private key"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "invalid_classifier",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "classifier 'Topic :: Software Development :: Widgets' is not a valid trove classifier (checked against trove-classifiers 2026.9.21.13); PyPI rejects the upload. Fix the spelling or remove it."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "8b29324522c07f2cb378896973511afb"
+          }
+        },
+        {
+          "ruleId": "readme_relative_links",
+          "ruleIndex": 5,
+          "level": "warning",
+          "message": {
+            "text": "long description links to 1 relative path(s) ('docs/logo.png'); PyPI does not resolve them, so they render broken. Use absolute https:// URLs"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "cfb6617767ad3cd3c57f0789e5f42172"
+          }
+        },
+        {
+          "ruleId": "secret_in_file",
+          "ruleIndex": 7,
+          "level": "error",
+          "message": {
+            "text": "'acme_widgets/settings.py' contains what looks like a Stripe live key (value not shown); it would be public on PyPI. If this is a deliberate test fixture, exempt it with --allow-path"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "6b56ea21bafa77883a5103ccc9a4665a"
+          }
+        },
+        {
+          "ruleId": "local_path_leak",
+          "ruleIndex": 3,
+          "level": "warning",
+          "message": {
+            "text": "1 file(s) contain a personal home-directory path for user(s) j*** (e.g. 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so'); it exposes a username and machine layout. Build in a clean container or strip paths"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "be10600da106efc0a6a4f732830748b4"
+          }
+        },
+        {
+          "ruleId": "binary_arch_mismatch",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' is built for arm64 but the wheel tag 'manylinux2014_x86_64' promises x86_64; it will fail to import there"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "d5001fb70b7a11812f5955384b6edfac"
+          }
+        },
+        {
+          "ruleId": "manylinux_glibc_too_new",
+          "ruleIndex": 4,
+          "level": "error",
+          "message": {
+            "text": "'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' references GLIBC_2.34 but the tag promises glibc 2.17; `auditwheel repair` would relabel it manylinux_2_34"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "c2b5ca1ccd0f7608b82316e415674337"
+          }
+        },
+        {
+          "ruleId": "sdist_version",
+          "ruleIndex": 6,
+          "level": "note",
+          "message": {
+            "text": "PKG-INFO version 1.0.0"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "acme_widgets-1.0.0.tar.gz"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "0771162cd5fefa4587438a4d7c943a90"
+          }
+        },
+        {
+          "ruleId": "diff_new_files",
+          "ruleIndex": 1,
+          "level": "note",
+          "message": {
+            "text": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl: 1 file(s) added (e.g. 'acme_widgets/settings.py')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "dist"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "reldoctor/v1": "d170dcf83422ab24dbe819e09e2310ec"
+          }
+        }
+      ]
+    }
+  ]
+}

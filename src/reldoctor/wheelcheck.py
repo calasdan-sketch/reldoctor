@@ -34,6 +34,11 @@ CHECKS_EXTRA: Dict[str, Tuple[str, str]] = {
     "abi3_extension_not_stable": ("warn", "abi3 wheel holds an extension that is built for one specific CPython version"),
     "tag_requires_python_conflict": ("warn", "the wheel's cpXY tag is a Python version Requires-Python excludes"),
     "packaging_rejects_metadata": ("error", "the 'packaging' library (which PyPI uses) rejects this METADATA"),
+    "wheel_version_unsupported": ("error", "WHEEL declares a Wheel-Version major other than 1; installers refuse the wheel"),
+    "wheel_version_newer": ("warn", "WHEEL declares Wheel-Version 1.x newer than 1.0; installers print a warning"),
+    "wheel_no_tag": ("warn", "WHEEL has no Tag line (PEP 427 requires at least one)"),
+    "purelib_unclear": ("warn", "WHEEL has no usable Root-Is-Purelib (true/false); installers may disagree on where to put the files"),
+    "script_hardcoded_interpreter": ("warn", "a script in .data/scripts has a #! line naming a fixed Python path, which installers do not rewrite"),
     "description_render_failed": ("error", "the long description does not render with readme_renderer (what PyPI uses)"),
 }
 
@@ -236,3 +241,48 @@ def render_problem(meta: email.message.Message, text: str) -> Optional[str]:
         first = " ".join(stream.getvalue().split())[:240]
         return first or "the renderer returned nothing"
     return None
+
+
+_WHEEL_VERSION = re.compile(r"^\s*(\d{1,4})\.(\d{1,4})\s*$")
+
+
+def check_wheel_file(wheel_meta) -> List[Pair]:
+    """Checks on the parsed ``.dist-info/WHEEL`` headers (PEP 427). A missing Wheel-Version is
+    reported separately (``wheel_no_version``)."""
+    out: List[Pair] = []
+    raw = (wheel_meta.get("Wheel-Version") or "").strip()
+    if raw:
+        m = _WHEEL_VERSION.match(raw)
+        if not m:
+            out.append(("wheel_version_unsupported", f"Wheel-Version {raw[:20]!r} is not of the form 1.0"))
+        elif int(m.group(1)) != 1:
+            out.append(("wheel_version_unsupported",
+                        f"Wheel-Version {raw} has major version {m.group(1)}; installers support major 1 only and "
+                        "refuse this wheel"))
+        elif int(m.group(2)) > 0:
+            out.append(("wheel_version_newer", f"Wheel-Version {raw}: installers that only know 1.0 print a warning"))
+    if not [t for t in wheel_meta.get_all("Tag", []) if t.strip()]:
+        out.append(("wheel_no_tag", "WHEEL has no Tag line"))
+    purelib = (wheel_meta.get("Root-Is-Purelib") or "").strip().lower()
+    if purelib not in ("true", "false"):
+        shown = purelib[:20] if purelib else "missing"
+        out.append(("purelib_unclear", f"Root-Is-Purelib is {shown!r}; write true (pure Python) or false (compiled code)"))
+    return out
+
+
+_FIXED_PYTHON_SHEBANG = re.compile(rb"^#![ \t]*(?:/[^\s]*?/)?(?:env[ \t]+(?:-S[ \t]+)?)?(python[0-9.]*w?)\b")
+
+
+def check_script_shebang(member: str, head: bytes) -> List[Pair]:
+    """``<name>-<ver>.data/scripts/*``: installers rewrite a ``#!python`` line to the target
+    interpreter; any other Python shebang is copied as written."""
+    first = head.split(b"\n", 1)[0].rstrip(b"\r")
+    if not first.startswith(b"#!") or first.startswith((b"#!python", b"#! python")):
+        return []
+    m = _FIXED_PYTHON_SHEBANG.match(first)
+    if not m:
+        return []
+    shown = first[:60].decode("ascii", "replace")
+    return [("script_hardcoded_interpreter",
+             f"script {member.rsplit('/', 1)[-1]!r} starts with {shown!r}; installers only rewrite '#!python', so this "
+             "path is used as is on every machine (and breaks in virtual environments). Use '#!python' or a console-script entry point")]

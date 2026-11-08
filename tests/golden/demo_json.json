@@ -1,0 +1,60 @@
+{
+  "errors": 4,
+  "warnings": 2,
+  "passed": false,
+  "checked": [
+    "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl",
+    "acme_widgets-1.0.0.tar.gz"
+  ],
+  "baselined": 0,
+  "findings": [
+    {
+      "severity": "error",
+      "code": "invalid_classifier",
+      "message": "classifier 'Topic :: Software Development :: Widgets' is not a valid trove classifier (checked against trove-classifiers 2026.9.21.13); PyPI rejects the upload. Fix the spelling or remove it.",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "warn",
+      "code": "readme_relative_links",
+      "message": "long description links to 1 relative path(s) ('docs/logo.png'); PyPI does not resolve them, so they render broken. Use absolute https:// URLs",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "error",
+      "code": "secret_in_file",
+      "message": "'acme_widgets/settings.py' contains what looks like a Stripe live key (value not shown); it would be public on PyPI. If this is a deliberate test fixture, exempt it with --allow-path",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "warn",
+      "code": "local_path_leak",
+      "message": "1 file(s) contain a personal home-directory path for user(s) j*** (e.g. 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so'); it exposes a username and machine layout. Build in a clean container or strip paths",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "error",
+      "code": "binary_arch_mismatch",
+      "message": "'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' is built for arm64 but the wheel tag 'manylinux2014_x86_64' promises x86_64; it will fail to import there",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "error",
+      "code": "manylinux_glibc_too_new",
+      "message": "'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' references GLIBC_2.34 but the tag promises glibc 2.17; `auditwheel repair` would relabel it manylinux_2_34",
+      "file": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl"
+    },
+    {
+      "severity": "info",
+      "code": "sdist_version",
+      "message": "PKG-INFO version 1.0.0",
+      "file": "acme_widgets-1.0.0.tar.gz"
+    },
+    {
+      "severity": "info",
+      "code": "diff_new_files",
+      "message": "acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl: 1 file(s) added (e.g. 'acme_widgets/settings.py')",
+      "file": ""
+    }
+  ]
+}

@@ -568,6 +568,10 @@ def _secret_findings(name: str, kinds: List[str], label: str) -> List[Finding]:
 
 # --- wheel -----------------------------------------------------------------
 
+_TAG_PART = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$")
+_NAME_PART = re.compile(r"^[A-Za-z0-9_.]+$")
+
+
 def _wheel_filename(fname: str) -> Optional[Tuple[str, str, Set[str]]]:
     if not fname.endswith(".whl"):
         return None
@@ -576,6 +580,9 @@ def _wheel_filename(fname: str) -> Optional[Tuple[str, str, Set[str]]]:
         return None
     py, abi, plat = parts[-3:]
     if len(parts) == 6 and not re.match(r"^\d", parts[2]):
+        return None
+    # packaging.utils.parse_wheel_filename refuses empty or odd tag parts (found by the round-5 differential test)
+    if not _TAG_PART.match(py) or not _TAG_PART.match(abi) or not _TAG_PART.match(plat) or not _NAME_PART.match(parts[0]):
         return None
     tags = {f"{a}-{b}-{c}" for a in py.split(".") for b in abi.split(".") for c in plat.split(".")}
     return parts[0], parts[1], tags
@@ -679,6 +686,7 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
                 wheel_meta = parse_metadata(wtext)
                 if not wheel_meta.get("Wheel-Version"):
                     out.append(_f("wheel_no_version", "WHEEL file lacks Wheel-Version", fname))
+                out.extend(_fp(wheelcheck.check_wheel_file(wheel_meta), fname))
                 wtags = set()
                 for raw_tag in wheel_meta.get_all("Tag", []):
                     bits = raw_tag.strip().split("-")
@@ -803,6 +811,8 @@ def check_wheel(path: str, allow: Tuple[str, ...] = ()) -> List[Finding]:
             bi = sniff(sc.head) if sc.head else None
             if bi is not None and wheelcheck.binary_is_library(info.filename):
                 natives.append(wheelcheck.NativeFile(info.filename, bi, sc.glibc_max, sc.musl, sc.glibc_needed, sc.glibcxx_max))
+            if sc.head and re.match(r"^[^/]+\.data/scripts/[^/]", info.filename):
+                out.extend(_fp(wheelcheck.check_script_shebang(info.filename, sc.head), fname))
             if info.filename.endswith(".pth") and info.file_size <= 65536:
                 out.extend(_fp(supply.analyze_pth(info.filename, sc.head.decode("utf-8", "replace")), fname))
         out.extend(agg.findings(fname))

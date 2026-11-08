@@ -258,8 +258,8 @@ def test_local_path_rules(tmp_path):
     # a real username inside a docstring seen once is trusted as an example ...
     assert "local_path_leak" not in codes(run({"acme_widgets/c.py": b"# /home/guido/data.txt"}))
     # ... but in compiled code or config it is a leak, with the name masked
-    f = [x for x in run({"acme_widgets/d.so": b"\0/home/dcalas/src/x.c\0"}) if x.code == "local_path_leak"]
-    assert f and "dcalas" not in f[0].message and "d***" in f[0].message
+    f = [x for x in run({"acme_widgets/d.so": b"\0/home/someuser/src/x.c\0"}) if x.code == "local_path_leak"]
+    assert f and "someuser" not in f[0].message and "s***" in f[0].message
     f = [x for x in run({"acme_widgets/e.json": b'{"p":"C:\\\\Users\\\\Dan Smith\\\\app"}'}) if x.code == "local_path_leak"]
     assert f and "Dan" not in f[0].message
 

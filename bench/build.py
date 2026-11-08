@@ -131,7 +131,7 @@ def build_wheel(out_dir: str, name: str = "acme_widgets", version: str = "1.0.0"
                 filename: Optional[str] = None, dist_info: Optional[str] = None,
                 compression: int = zipfile.ZIP_DEFLATED, wheel_tags: Optional[List[str]] = None,
                 license_file: bool = True, extra_members: Optional[List[Tuple[str, bytes]]] = None,
-                top_init: bool = True) -> str:
+                top_init: bool = True, wheel_version: str = "1.0") -> str:
     dist_info = dist_info or f"{name}-{version}.dist-info"
     fields = default_metadata(name, version, requires_python)
     if meta:
@@ -147,7 +147,7 @@ def build_wheel(out_dir: str, name: str = "acme_widgets", version: str = "1.0.0"
         purelib = tag.endswith("-any")
     tags = wheel_tags or [tag]
     members[f"{dist_info}/WHEEL"] = (
-        "Wheel-Version: 1.0\nGenerator: bench (1.0)\n"
+        f"Wheel-Version: {wheel_version}\nGenerator: bench (1.0)\n"
         f"Root-Is-Purelib: {'true' if purelib else 'false'}\n" + "".join(f"Tag: {t}\n" for t in tags)).encode()
     if entry_points:
         members[f"{dist_info}/entry_points.txt"] = entry_points.encode()

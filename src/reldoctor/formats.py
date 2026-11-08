@@ -35,6 +35,7 @@ def to_sarif(findings, checks: Dict[str, Tuple[str, str]], version: str) -> str:
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{"tool": {"driver": {"name": "reldoctor", "version": version,
+                                      "organization": "Calas Automations Inc.",
                                       "informationUri": "https://github.com/calasdan-sketch/reldoctor",
                                       "rules": rules}},
                   "results": results}],
@@ -67,7 +68,7 @@ def to_junit(findings, strict: bool) -> str:
             + "\n".join(cases) + "\n</testsuite>")
 
 
-def to_markdown(findings, failed: bool, errors: int, warns: int) -> str:
+def to_markdown(findings, failed: bool, errors: int, warns: int, baselined: int = 0) -> str:
     """A table for $GITHUB_STEP_SUMMARY or a pull-request comment."""
     from .safety import escape_terminal
 
@@ -78,6 +79,8 @@ def to_markdown(findings, failed: bool, errors: int, warns: int) -> str:
         return text
 
     head = f"### reldoctor: {'FAIL' if failed else 'PASS'} ({errors} error(s), {warns} warning(s))"
+    if baselined:
+        head += f"\n\n{baselined} accepted warning(s) hidden by the baseline."
     if not findings:
         return head
     rows = ["| | check | file | what |", "|---|---|---|---|"]

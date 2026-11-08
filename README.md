@@ -38,13 +38,13 @@ checked 2 file(s): acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl, acme
 
 ## What it checks
 
-`reldoctor --list-checks` prints all 137 check codes with their severity. In groups:
+`reldoctor --list-checks` prints all 142 check codes with their severity. In groups:
 
 | Area | Examples |
 |---|---|
 | **Will PyPI accept it?** | rules taken from PyPI's own upload code (warehouse `forklift/legacy.py`, `forklift/metadata.py`, `utils/wheel.py`) and `packaging.metadata`: direct URLs or unparseable PEP 508 strings in `Requires-`/`Provides-`/`Obsoletes-Dist`; unsupported `Metadata-Version`; invalid or deprecated trove classifiers; invalid SPDX `License-Expression`; `License` + `License-Expression` and missing `License-File`s (PEP 639); platform tags off PyPI's accept-list (`linux_x86_64`); non-normalized wheel names and `.dist-info` dirs; invalid author emails and `Dynamic` fields; `Description-Content-Type`; `+local` and over-long versions; Summary over 512 chars; Project-URL labels over 32 chars; non-normalized member paths; bzip2/lzma wheel members; zip-bomb ratios; GNU sparse tar members; files over 100 MiB |
-| **Does the wheel tell the truth?** | native libraries are read (ELF, Mach-O thin and fat, PE) and compared with the platform tag: CPU architecture, operating system, newest `GLIBC_x.y` and `GLIBCXX_3.4.N` against the manylinux floor (policy data from auditwheel), glibc-vs-musl, macOS deployment target against `macosx_X_Y`, `cpython-3NN` extension suffix against the `cpNNN`/`abi3` tag, `Requires-Python` against the `cpXY` tag, `Root-Is-Purelib`, platform tag with no compiled code |
-| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`, `.docker/config.json`, kubeconfigs, cloud service-account keys, shell histories, `.npmrc`, `.p12`/`.jks`, `terraform.tfstate` (and, as warnings, `credentials.json`, `secrets.yml`, `local_settings.py`, `*.env`...); PEM private keys (also `\n`-escaped inside JSON), AWS, GitHub, GitLab, PyPI and TestPyPI, npm, Slack, Discord, Google, Stripe live, OpenAI, Anthropic, SendGrid, Hugging Face, Shopify, Docker Hub, DigitalOcean, Databricks and Vault tokens, Azure storage keys, database URLs with passwords, inside files of any size (including content reached through sdist hardlinks), inside UTF-16 text (what PowerShell's `>` writes), and inside zip / tar / gzip / bzip2 / xz files bundled in the release (two levels deep, bounded). Documented examples and placeholders (`AKIAIOSFODNN7EXAMPLE`, `${NPM_TOKEN}`) are ignored. Personal home-directory paths (`/home/<user>/`, `C:\Users\<user>\`) in compiled code and configs, source maps, SQLite files. Secret values and URL credentials are redacted from every message |
+| **Does the wheel tell the truth?** | native libraries are read (ELF, Mach-O thin and fat, PE) and compared with the platform tag: CPU architecture, operating system, newest `GLIBC_x.y` and `GLIBCXX_3.4.N` against the manylinux floor (policy data from auditwheel), glibc-vs-musl, macOS deployment target against `macosx_X_Y`, `cpython-3NN` extension suffix against the `cpNNN`/`abi3` tag, `Requires-Python` against the `cpXY` tag, `Root-Is-Purelib`, platform tag with no compiled code; the WHEEL file itself (`Wheel-Version` major other than 1, no `Tag`, no usable `Root-Is-Purelib`); `.data/scripts` with a fixed `#!/usr/bin/python3` instead of `#!python` |
+| **Leaks** | `.env`, `.pypirc`, `.netrc`, SSH keys, `.aws/credentials`, `.docker/config.json`, kubeconfigs, cloud service-account keys, shell histories, `.npmrc`, `.p12`/`.jks`, `terraform.tfstate` (and, as warnings, `credentials.json`, `secrets.yml`, `local_settings.py`, `*.env`...); PEM private keys (also `\n`-escaped inside JSON), AWS, GitHub, GitLab, PyPI and TestPyPI, npm, Slack, Discord, Google, Stripe live, OpenAI, Anthropic, SendGrid, Hugging Face, Shopify, Docker Hub, DigitalOcean, Databricks and Vault tokens, Azure storage keys, database URLs and `https://user:password@host` URLs with passwords, inside files of any size (including content reached through sdist hardlinks), inside UTF-16 text (what PowerShell's `>` writes), and inside zip / tar / gzip / bzip2 / xz files bundled in the release (two levels deep, bounded). Documented examples and placeholders (`AKIAIOSFODNN7EXAMPLE`, `${NPM_TOKEN}`) are ignored. Personal home-directory paths (`/home/<user>/`, `C:\Users\<user>\`) in compiled code and configs, source maps, SQLite files. Secret values and URL credentials are redacted from every message |
 | **Install-time code** | `setup.py` parsed with `ast` (never run) for network calls, hidden `exec(base64...)` payloads and subprocess use; `.pth` files that run code at every Python start; obfuscated `exec()`/`eval()` in any module; console scripts named `pip`, `sudo`, `ls`...; top-level modules that shadow the standard library; top-level `tests/` or `docs/`; project name one edit from a top-1,500 PyPI project |
 | **Release diff** (`--against`) | same filename already released (PyPI never accepts a re-upload), size jump, new or removed dependencies, `Requires-Python` raised, new or removed console scripts, new native/`.pth`/script files, vanished packages, a platform wheel that was published last time and is missing now, license change |
 | **Integrity** | every RECORD row's sha256 and size against the real file, files missing from / extra to RECORD, md5/sha1 hashes, malformed RECORD CSV, duplicate zip entries |
@@ -66,6 +66,8 @@ reldoctor dist/ --format junit > reldoctor.xml     # JUnit XML for CI dashboards
 reldoctor dist/ --format markdown >> "$GITHUB_STEP_SUMMARY"   # a table on the workflow run page
 reldoctor --explain secret_in_file           # what a check means and how to fix it
 reldoctor dist/ --against prev/              # also compare with the previous release (offline)
+reldoctor dist/ --write-baseline reldoctor-baseline.json   # accept today's warnings (once, when adopting)
+reldoctor dist/ --strict --baseline reldoctor-baseline.json  # ...then fail only on new ones
 python -m reldoctor dist/                    # same thing without the script on PATH
 reldoctor dist/ --ignore no_summary,dev_version
 reldoctor dist/ --allow-path 'tests/certs/*' # deliberate test keys: exempt from leak checks only
@@ -84,6 +86,7 @@ strict = true                       # warnings fail too
 ignore = ["typosquat_name"]         # silence check codes (never the locked ones)
 allow-path = ["tests/certs/*"]      # deliberate fixtures, exempt from the leak checks only
 against = ["prev/"]                 # previous release, relative to this file
+baseline = "reldoctor-baseline.json"  # accepted warnings (see below), relative to this file
 max-members = 50000
 ```
 
@@ -93,6 +96,19 @@ skips it. A typo'd key or wrong type is an error, the locked checks stay locked 
 are still refused. If you audit artifacts from an untrusted pull request, run with `--no-config`: a
 config file can silence checks. On Python before 3.11 without `tomli`, only a plain `[tool.reldoctor]` table is read
 (anything else is an error, not silently skipped).
+
+### Adopting reldoctor on an old project: `--baseline`
+
+An existing project often has a few warnings it cannot fix today, and `--strict` would turn CI red on day one.
+Run `reldoctor dist/ --write-baseline reldoctor-baseline.json` once and commit the file. From then on
+`--baseline reldoctor-baseline.json` (or `baseline = "..."` in `[tool.reldoctor]`) hides exactly those warnings
+and fails on anything new. The rules are strict on purpose:
+
+- only **warnings** are recorded; errors (what PyPI or an installer rejects, leaked secrets) are never hidden, even if someone edits the file by hand;
+- an entry is the check code, the artifact, and the full message with the release version blanked out, so it survives a version bump but a different file or path is a new finding;
+- release-comparison findings (`diff_*`) are never recorded;
+- a missing, oversized or malformed baseline is a usage error (exit 2), never "no baseline";
+- entries that no longer match anything are reported on stderr, so the file shrinks as you fix things (rerun `--write-baseline`).
 
 Releases of three or more artifacts totalling over 64 MiB are scanned in parallel (up to 4 worker processes);
 `--jobs N` sets it and `--jobs 1` turns it off.
@@ -168,6 +184,7 @@ Why the leak check matters: GitGuardian's scan of PyPI found 3,938 unique secret
   machine formats are written as UTF-8; wildcards are expanded by reldoctor itself), and the CI workflow has a
   `windows-latest` job, but nobody has watched it pass there yet. Tested for real: Python 3.11, 3.12 and 3.13 on Linux.
   Python 3.9 and 3.10 are checked by syntax only until the CI matrix has run.
+- A baseline matches on the exact message, so a warning whose text contains a changing number (for example a count of files) reappears as new when the number changes. That fails closed on purpose.
 - It inspects artifacts, not your source tree, and never contacts PyPI. Anything that depends on
   PyPI's live state is out of reach: whether the name is taken, project size quotas, per-project
   file-size overrides, its malware scan, trusted-publishing and attestation setup (PEP 740).

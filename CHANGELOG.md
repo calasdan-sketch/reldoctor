@@ -5,6 +5,31 @@
 Expert round 2: PyPI-maintainer, supply-chain, release-engineering and wheel-tag review, with a
 committed benchmark (`bench/`, results in `bench/RESULTS.md`).
 
+### Round 5 (additions on this unreleased line)
+Specialists: a PyPA/warehouse maintainer, a release engineer, a supply-chain/secret-leak auditor and a wheel-format
+specialist (findings, each with the command that proved it, in `docs/ROUND5.md`). Two passes: build, then attack the result.
+
+- Added: `--baseline FILE` and `--write-baseline FILE` (and `baseline = "..."` in `[tool.reldoctor]`). Adopt reldoctor on a
+  project that already has warnings: record them once, then fail only on new ones. Only warnings are recorded, errors are
+  never hidden, `diff_*` findings are never recorded, a missing or malformed file is a usage error (exit 2). Entries survive a
+  version bump (the release version is blanked out) but not a changed message or file.
+- Added: WHEEL-file checks: `wheel_version_unsupported` (error: Wheel-Version major other than 1; installers refuse it),
+  `wheel_version_newer`, `wheel_no_tag`, `purelib_unclear` (warnings).
+- Added: `script_hardcoded_interpreter` (warning): a script in `.data/scripts` that starts `#!/usr/bin/python3` (or any
+  fixed Python path) is not rewritten by installers, unlike `#!python`.
+- Added: secret kind "URL with embedded password" (`https://user:secret@host`, `git+https://...`); placeholders such as
+  `user:password@`, `${TOKEN}` and `{token}` are ignored. New file names: Ansible vault password files, `.s3cfg`, `.my.cnf`
+  (errors); `.mcp.json`, `.cursor/mcp.json`, `.claude/settings.local.json`, `.cargo/credentials*` (warnings).
+- Added: `reldoctor[oracle]`/`[all]` also install `trove-classifiers`; when it is importable a classifier it knows is never
+  reported as invalid, and when the bundled classifier list is over 180 days old the `invalid_classifier` message says so.
+- Added: `__author__`, SARIF `organization`, and the `--help` footer name "Calas Automations Inc."; a test pins the author line.
+- Fixed: a wheel filename with an empty or odd tag part (`name-1.0--py3-none.whl`) was accepted by the filename parser;
+  it is now `bad_wheel_filename` (found by a differential test against `packaging.utils.parse_wheel_filename`).
+- Tests: golden files for all six output formats (`tests/golden/`), seeded property tests, differential tests against
+  `packaging`, and mutation-style sanity tests; the benchmark corpus gained 7 cases.
+- Unchanged: exit codes, `--json` fields (one added: `baselined`), stdout/stderr split. 0.1.0 (the only PyPI release so far)
+  had no settings or state files, so there is nothing to migrate; its `--json` output is a subset of this one.
+
 ### Round 4 (additions on this unreleased line)
 Specialists: a first-hour user following only the README, a release/packaging engineer, a supply-chain reviewer, a
 docs/DX writer, a CI integrator, a hostile-input fuzzer, a performance engineer, a Windows packager, a competitor's maintainer

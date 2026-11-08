@@ -37,9 +37,9 @@ Changelog = "https://github.com/calasdan-sketch/reldoctor/blob/main/CHANGELOG.md
 
 [project.optional-dependencies]
 # Second opinions: when installed, reldoctor also asks the libraries PyPI itself uses.
-oracle = ["packaging>=24.2"]
+oracle = ["packaging>=24.2", "trove-classifiers>=2024.1.1"]
 render = ["readme_renderer[md]>=43.0"]
-all = ["packaging>=24.2", "readme_renderer[md]>=43.0"]
+all = ["packaging>=24.2", "trove-classifiers>=2024.1.1", "readme_renderer[md]>=43.0"]
 
 [project.scripts]
 reldoctor = "reldoctor.cli:main"

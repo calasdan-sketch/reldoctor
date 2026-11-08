@@ -9,6 +9,7 @@ import sys
 from typing import List
 
 from . import __version__
+from . import baseline as _baseline
 from . import config as _config
 from . import doctor
 from .doctor import CHECKS, UNIGNORABLE, Finding, diagnose
@@ -24,7 +25,7 @@ def _gh_escape(value: str, prop: bool = False) -> str:
 
 
 def _render_text(findings: List[Finding], errors: int, warns: int, failed: bool,
-                 checked: List[str] | None = None) -> str:
+                 checked: List[str] | None = None, baselined: int = 0) -> str:
     lines = []
     for f in findings:
         where = f"[{escape_terminal(f.file)}] " if f.file else ""
@@ -34,11 +35,13 @@ def _render_text(findings: List[Finding], errors: int, warns: int, failed: bool,
         # without this a clean run says nothing about WHICH files were looked at
         shown = ", ".join(escape_terminal(c) for c in checked[:6]) + (f", +{len(checked) - 6} more" if len(checked) > 6 else "")
         lines.append(f"checked {len(checked)} file(s): {shown}")
+    if baselined:
+        lines.append(f"{baselined} accepted warning(s) hidden by the baseline")
     lines.append(f"\n{errors} error(s), {warns} warning(s) - {verdict}")
     return "\n".join(lines)
 
 
-def _render_github(findings: List[Finding], errors: int, warns: int, failed: bool) -> str:
+def _render_github(findings: List[Finding], errors: int, warns: int, failed: bool, baselined: int = 0) -> str:
     level = {"error": "error", "warn": "warning", "info": "notice"}
     lines = []
     for f in findings:
@@ -47,6 +50,8 @@ def _render_github(findings: List[Finding], errors: int, warns: int, failed: boo
         props = f"title={_gh_escape('reldoctor ' + f.code, prop=True)}"
         where = f"[{f.file}] " if f.file else ""
         lines.append(f"::{level[f.severity]} {props}::{_gh_escape(where + f.message)}")
+    if baselined:
+        lines.append(f"reldoctor: {baselined} accepted warning(s) hidden by the baseline")
     lines.append(f"reldoctor: {errors} error(s), {warns} warning(s) - {'FAIL' if failed else 'PASS'}")
     return "\n".join(lines)
 
@@ -104,6 +109,7 @@ def _main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="reldoctor",
         description="Audit wheel + sdist the way PyPI and pip will see them.",
+        epilog="reldoctor is made by Calas Automations Inc. (MIT license).",
     )
     ap.add_argument("paths", nargs="*", metavar="PATH",
                     help="dist directory and/or .whl / .tar.gz files (e.g. dist/)")
@@ -120,6 +126,12 @@ def _main(argv: List[str] | None = None) -> int:
     ap.add_argument("--allow-path", action="append", default=[], metavar="GLOB",
                     help="exempt archive paths matching GLOB from the secret/credential checks "
                          "(e.g. 'tests/certs/*'); repeatable")
+    ap.add_argument("--baseline", metavar="FILE",
+                    help="hide the warnings listed in FILE (made with --write-baseline) and fail only on new ones. "
+                         "Errors are never hidden; a missing or broken FILE is an error")
+    ap.add_argument("--write-baseline", metavar="FILE",
+                    help="record today's warnings in FILE for --baseline, then continue as usual "
+                         "(errors still fail the run)")
     ap.add_argument("--max-members", type=int, default=None, metavar="N",
                     help=f"refuse archives with more than N members (default {doctor.DEFAULT_MAX_MEMBERS})")
     ap.add_argument("--jobs", type=int, default=None, metavar="N",
@@ -166,6 +178,8 @@ def _main(argv: List[str] | None = None) -> int:
     # Windows users type tests\\certs\\*; archive member names always use forward slashes
     args.allow_path = [a.replace("\\", "/") for a in list(cfg.get("allow-path", [])) + args.allow_path]
     args.against = [a if os.path.isabs(a) else os.path.join(cfg_dir, a) for a in cfg.get("against", [])] + args.against
+    if args.baseline is None and cfg.get("baseline"):
+        args.baseline = cfg["baseline"] if os.path.isabs(cfg["baseline"]) else os.path.join(cfg_dir, cfg["baseline"])
     if args.max_members is None:
         args.max_members = cfg.get("max-members", doctor.DEFAULT_MAX_MEMBERS)
 
@@ -206,6 +220,29 @@ def _main(argv: List[str] | None = None) -> int:
         return 2
 
     findings = [f for f in findings if f.code not in ignored]
+    baselined, stale = 0, []
+    if args.baseline or args.write_baseline:
+        if args.write_baseline:
+            try:
+                n = _baseline.write(args.write_baseline, findings)
+            except OSError as e:
+                print(f"reldoctor: cannot write the baseline {escape_terminal(args.write_baseline)}: "
+                      f"{e.strerror or e}", file=sys.stderr)
+                return 2
+            print(f"reldoctor: wrote {n} accepted warning(s) to {escape_terminal(args.write_baseline)}",
+                  file=sys.stderr)
+        if args.baseline:
+            try:
+                accepted = _baseline.load(args.baseline)
+            except _baseline.BaselineError as e:
+                print(f"reldoctor: baseline {escape_terminal(args.baseline)}: {escape_terminal(str(e))}",
+                      file=sys.stderr)
+                return 2
+            findings, baselined, stale = _baseline.apply(findings, accepted)
+            stale = [e for e in stale if e[0] not in ignored]   # silenced by --ignore, not fixed
+            if stale:
+                print(f"reldoctor: {len(stale)} baseline entr{'y' if len(stale) == 1 else 'ies'} no longer match "
+                      "anything (fixed?); rerun with --write-baseline to drop them", file=sys.stderr)
     try:
         _w, _s, _z, _d = doctor._iter_artifacts(args.paths)
         checked = [os.path.basename(x) for x in _w + _s + _z]
@@ -220,17 +257,17 @@ def _main(argv: List[str] | None = None) -> int:
         from . import formats   # xml.sax pulls in urllib.request: ~0.1 s of start-up the text/json paths never need
     if fmt == "json":
         text = json.dumps({"errors": errors, "warnings": warns, "passed": not failed,
-                           "checked": checked, "findings": [f.as_dict() for f in findings]}, indent=2)
+                           "checked": checked, "baselined": baselined, "findings": [f.as_dict() for f in findings]}, indent=2)
     elif fmt == "github":
-        text = _render_github(findings, errors, warns, failed)
+        text = _render_github(findings, errors, warns, failed, baselined)
     elif fmt == "sarif":
         text = formats.to_sarif(findings, CHECKS, __version__)
     elif fmt == "junit":
         text = formats.to_junit(findings, args.strict)
     elif fmt == "markdown":
-        text = formats.to_markdown(findings, failed, errors, warns)
+        text = formats.to_markdown(findings, failed, errors, warns, baselined)
     else:
-        text = _render_text(findings, errors, warns, failed, checked)
+        text = _render_text(findings, errors, warns, failed, checked, baselined)
     try:
         _write(text, utf8=fmt != "text")
     except BrokenPipeError:  # e.g. `reldoctor dist/ | head`; the exit code still counts

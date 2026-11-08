@@ -1,0 +1,9 @@
+::error title=reldoctor invalid_classifier::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] classifier 'Topic :: Software Development :: Widgets' is not a valid trove classifier (checked against trove-classifiers 2026.9.21.13); PyPI rejects the upload. Fix the spelling or remove it.
+::warning title=reldoctor readme_relative_links::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] long description links to 1 relative path(s) ('docs/logo.png'); PyPI does not resolve them, so they render broken. Use absolute https:// URLs
+::error title=reldoctor secret_in_file::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] 'acme_widgets/settings.py' contains what looks like a Stripe live key (value not shown); it would be public on PyPI. If this is a deliberate test fixture, exempt it with --allow-path
+::warning title=reldoctor local_path_leak::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] 1 file(s) contain a personal home-directory path for user(s) j*** (e.g. 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so'); it exposes a username and machine layout. Build in a clean container or strip paths
+::error title=reldoctor binary_arch_mismatch::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' is built for arm64 but the wheel tag 'manylinux2014_x86_64' promises x86_64; it will fail to import there
+::error title=reldoctor manylinux_glibc_too_new::[acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl] 'acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so' references GLIBC_2.34 but the tag promises glibc 2.17; `auditwheel repair` would relabel it manylinux_2_34
+::notice title=reldoctor sdist_version::[acme_widgets-1.0.0.tar.gz] PKG-INFO version 1.0.0
+::notice title=reldoctor diff_new_files::acme_widgets-1.0.0-cp312-cp312-manylinux2014_x86_64.whl: 1 file(s) added (e.g. 'acme_widgets/settings.py')
+reldoctor: 4 error(s), 2 warning(s) - FAIL

@@ -169,6 +169,15 @@ def _(d):
     rel(d, sdist=dict(setup_py="from setuptools import setup\nsetup()\n"))
 
 
+@case("good_data_scripts_rewritable", "good", "good", note="#!python is rewritten by installers; shell scripts are fine")
+def _(d): rel(d, wheel=dict(files={"acme_widgets-1.0.0.data/scripts/acme": b"#!python\nprint(1)\n",
+                                   "acme_widgets-1.0.0.data/scripts/acme.sh": b"#!/bin/sh\necho hi\n"}))
+
+
+@case("good_url_placeholders_in_docs", "good", "good", note="https://user:password@host style examples are not leaks")
+def _(d): rel(d, wheel=dict(files={"acme_widgets/README.rst": b"Use https://user:password@pkgs.corp.net/simple or https://${USER}:${TOKEN}@pkgs.corp.net/simple\n"}))
+
+
 @case("good_testing_dir_in_package", "good", "good")
 def _(d):
     pair(d, files={"acme_widgets/tests/__init__.py": b"", "acme_widgets/tests/test_x.py": b"def test(): pass\n"})
@@ -306,11 +315,24 @@ leak("leak_git_dir", "acme_widgets/.git/config", b"[core]\n", {"vcs_metadata_shi
 leak("leak_sourcemap", "acme_widgets/static/app.js.map", b'{"version":3,"sources":["src/app.ts"]}', {"source_map_shipped"}, "supply")
 leak("leak_sqlite_db", "acme_widgets/data/cache.db", b"SQLite format 3\x00" + b"\0" * 100, {"database_file_shipped"}, "supply")
 leak("leak_home_path_in_binary", "acme_widgets/_speed.cpython-312-x86_64-linux-gnu.so",
-     elf(62, "GLIBC_2.17") + b"/home/dcalas/projects/acme/src/lib.c\0", {"local_path_leak"}, "supply")
+     elf(62, "GLIBC_2.17") + b"/home/someuser/projects/acme/src/lib.c\0", {"local_path_leak"}, "supply")
 
 
 @case("leak_home_path_in_json", "bad", "supply", {"local_path_leak"}, False)
-def _(d): rel(d, wheel=dict(files={"acme_widgets/build_info.json": b'{"root": "/Users/dcalas/work/acme"}'}))
+def _(d): rel(d, wheel=dict(files={"acme_widgets/build_info.json": b'{"root": "/Users/someuser/work/acme"}'}))
+
+
+leak("leak_credential_url", "acme_widgets/cfg.py", frag("INDEX = 'https", "://deploy:", "Zq8Lm2Vx9Kd4", "@pkgs.corp-internal.net/simple'\n").encode(), {"secret_in_file"})
+leak("leak_vault_password_file", "ansible/.vault_pass", b"hunter2\n", {"sensitive_file"})
+leak("leak_agent_settings", "acme_widgets/.claude/settings.local.json", b'{"env": {}}', {"maybe_sensitive_file"})
+
+
+@case("wheel_version_major_2", "bad", "integrity", {"wheel_version_unsupported"}, False, note="pip and installer refuse it at install time")
+def _(d): wheel_only(d, wheel_version="2.0")
+
+
+@case("script_hardcoded_python", "bad", "supply", {"script_hardcoded_interpreter"}, False)
+def _(d): rel(d, wheel=dict(files={"acme_widgets-1.0.0.data/scripts/acme": b"#!/usr/bin/python3\nprint(1)\n"}))
 
 
 @case("leak_in_sdist_only", "bad", "leak", {"sensitive_file", "secret_in_file"}, False)

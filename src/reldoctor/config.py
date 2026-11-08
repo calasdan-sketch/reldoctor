@@ -6,6 +6,7 @@ strict = true                       # warnings fail too
 ignore = ["typosquat_name"]         # silence check codes (never the locked ones)
 allow-path = ["tests/certs/*"]      # deliberate fixtures, exempt from the leak checks
 against = ["prev/"]                 # previous release, relative to this file
+baseline = "reldoctor-baseline.json"  # accepted warnings (see --write-baseline), relative to this file
 max-members = 50000
 ```
 
@@ -21,7 +22,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-KEYS = {"strict": bool, "ignore": list, "allow-path": list, "against": list, "max-members": int}
+KEYS = {"baseline": str, "strict": bool, "ignore": list, "allow-path": list, "against": list, "max-members": int}
 _HEADER = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$")
 
 
@@ -147,6 +148,8 @@ def load(path: str) -> Tuple[Dict[str, Any], str]:
         val = table[key]
         if want is int and (isinstance(val, bool) or not isinstance(val, int)):
             raise ConfigError(f"{key} must be an integer")
+        if want is str and (not isinstance(val, str) or not val.strip()):
+            raise ConfigError(f"{key} must be a non-empty string")
         if want is bool and not isinstance(val, bool):
             raise ConfigError(f"{key} must be true or false")
         if want is list and (not isinstance(val, list) or not all(isinstance(x, str) for x in val)):

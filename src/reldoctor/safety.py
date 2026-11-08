@@ -129,6 +129,10 @@ _TOKEN_SOURCES: List[Tuple[str, str]] = [
      r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}"),
     ("Azure storage account key", r"\bAccountKey=[A-Za-z0-9+/]{86}=="),
     ("npm auth token in .npmrc", r"_authToken\s*=\s*[A-Za-z0-9_\-./+=]{16,}"),
+    # https://user:secret@host/ in config, requirements or scripts (pip's --index-url / git+https URLs
+    # are the classic way these leak). Placeholders are filtered like the database URLs below.
+    ("URL with embedded password",
+     r"\b(?:https?|ftps?|ssh|svn|git\+https?|git\+ssh)://[^\s:/@'\"<>]{1,64}:[^\s/@'\"<>]{6,}@[^\s'\"<>/]+"),
     ("database URL with password",
      r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^\s:/@'\"<>]+:[^\s/@'\"<>]{4,}@[^\s'\"<>/]+"),
 ]
@@ -158,6 +162,7 @@ _NEEDLES = {
     "Azure storage account key": (b"AccountKey=",),
     "npm auth token in .npmrc": (b"_authToken",),
     "database URL with password": (b"://",),
+    "URL with embedded password": (b"://",),
 }
 SECRET_PATTERNS = [(kind, re.compile(src.encode()), _NEEDLES[kind]) for kind, src in _TOKEN_SOURCES]
 # one pass over a file decides whether ANY of the 22 patterns can match, instead of 36 separate `in` scans
@@ -385,6 +390,10 @@ SENSITIVE_BASENAMES = {
     "application_default_credentials.json": "Google Cloud credentials",
     "serviceAccountKey.json": "cloud service-account key",
     "wallet.dat": "cryptocurrency wallet",
+    ".vault_pass": "Ansible vault password", ".vault-pass": "Ansible vault password",
+    ".vault_pass.txt": "Ansible vault password", "vault_pass.txt": "Ansible vault password",
+    ".vault-password": "Ansible vault password", ".s3cfg": "s3cmd credentials",
+    ".my.cnf": "MySQL client credentials",
 }
 # names that are credentials in practice but can also be harmless data: warn, do not fail
 MAYBE_SENSITIVE_BASENAMES = {
@@ -393,6 +402,13 @@ MAYBE_SENSITIVE_BASENAMES = {
     "cookies.txt": "browser cookie export", "local_settings.py": "local settings (usually holds secrets)",
     "settings_local.py": "local settings (usually holds secrets)", ".envrc": "direnv file (often exports secrets)",
     "master.key": "Rails master key",
+    ".mcp.json": "MCP server config (often holds API keys in env)",
+}
+# (parent directory, file name) pairs: agent and editor settings that commonly carry API keys
+MAYBE_SENSITIVE_IN_DIR = {
+    (".claude", "settings.local.json"): "Claude Code local settings",
+    (".cursor", "mcp.json"): "MCP server config (often holds API keys in env)",
+    (".vscode", "mcp.json"): "MCP server config (often holds API keys in env)",
 }
 _SENSITIVE_PATTERNS = [
     (re.compile(r"^client_secrets?[\w.-]*\.json$", re.I), "OAuth client secret"),
@@ -442,6 +458,11 @@ def maybe_sensitive_file_kind(name: str) -> Optional[str]:
     base = name.rstrip("/").rsplit("/", 1)[-1]
     if base in MAYBE_SENSITIVE_BASENAMES:
         return MAYBE_SENSITIVE_BASENAMES[base]
+    parts = [p for p in name.split("/") if p]
+    if len(parts) >= 2 and (parts[-2], parts[-1]) in MAYBE_SENSITIVE_IN_DIR:
+        return MAYBE_SENSITIVE_IN_DIR[(parts[-2], parts[-1])]
+    if len(parts) >= 2 and parts[-2] in (".cargo", ".gem") and parts[-1] in ("credentials", "credentials.toml"):
+        return "package registry credentials"
     low = base.lower()
     if low.endswith(".env") and len(low) > 4 and low[:-4] not in _ENV_TEMPLATES:
         return "dotenv-style file"

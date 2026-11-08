@@ -7,6 +7,7 @@ Functions return (code, message) pairs; doctor.py turns them into Findings.
 """
 from __future__ import annotations
 
+import datetime
 import email.message
 import email.utils
 import os
@@ -73,19 +74,43 @@ def table_versions() -> Dict[str, str]:
 
 # --- classifiers -----------------------------------------------------------
 
+def _snapshot_age_days(header: str) -> Optional[int]:
+    """Days between the bundled classifier list's date (trove-classifiers YYYY.M.D.N) and today."""
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", header)
+    if not m:
+        return None
+    try:
+        return (datetime.date.today() - datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))).days
+    except ValueError:
+        return None
+
+
+def _live_classifiers() -> Optional[FrozenSet[str]]:
+    """The classifier list of an installed ``trove_classifiers`` (what PyPI itself uses), if any."""
+    try:
+        import trove_classifiers  # type: ignore[import-not-found]
+        return frozenset(trove_classifiers.classifiers)
+    except Exception:  # noqa: BLE001 - absent or broken: the bundled list decides
+        return None
+
+
 def check_classifiers(meta: email.message.Message) -> List[Pair]:
     valid, deprecated, header = _trove()
+    live = _live_classifiers()
     out: List[Pair] = []
     bad, dep = [], []
     for c in dict.fromkeys(x.strip() for x in meta.get_all("Classifier", [])):
         if c in deprecated:
             dep.append(c)
-        elif c not in valid:
+        elif c not in valid and not (live and c in live):
             bad.append(c)
+    age = _snapshot_age_days(header)
+    stale = (f" The bundled list is {age} days old: if this classifier was added to PyPI recently, upgrade "
+             "reldoctor (or `pip install trove-classifiers`) and run again.") if age is not None and age > 180 else ""
     for c in bad:
         out.append(("invalid_classifier",
                     f"classifier {c!r} is not a valid trove classifier (checked against {header}); "
-                    "PyPI rejects the upload. Fix the spelling or remove it"))
+                    f"PyPI rejects the upload. Fix the spelling or remove it.{stale}"))
     for c in dep:
         repl = deprecated[c]
         hint = f"use {' or '.join(map(repr, repl))} instead" if repl else "remove it"
